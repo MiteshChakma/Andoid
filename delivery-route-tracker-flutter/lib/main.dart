@@ -88,8 +88,11 @@ class _DeliveryTrackerAppState extends State<DeliveryTrackerApp> {
 }
 
 class TrackerPage extends StatefulWidget {
-  const TrackerPage(
-      {super.key, required this.darkMode, required this.onDarkModeChanged});
+  const TrackerPage({
+    super.key,
+    required this.darkMode,
+    required this.onDarkModeChanged,
+  });
 
   final bool darkMode;
   final ValueChanged<bool> onDarkModeChanged;
@@ -104,6 +107,8 @@ class _TrackerPageState extends State<TrackerPage> {
   static const _trackingNotificationId = 1001;
   static const _stopNotificationId = 1002;
   static const _batterySafeModeKey = 'battery_safe_mode';
+  static const _activeShiftKey = 'active_shift_id';
+  static const _shiftRecoveryGraceMinutesKey = 'shift_recovery_grace_minutes';
   static const _maxAcceptedAccuracyMeters = 55.0;
   static const _maxAcceptedSpeedMetersPerSecond = 45.0;
 
@@ -124,6 +129,7 @@ class _TrackerPageState extends State<TrackerPage> {
   bool _batterySafeMode = true;
   bool _locationStreamStoppedMode = false;
   String _lastGpsError = 'No GPS errors logged';
+  int _shiftRecoveryGraceMinutes = 120;
   final List<DiagnosticEntry> _diagnostics = [];
   int _tabIndex = 0;
 
@@ -149,13 +155,64 @@ class _TrackerPageState extends State<TrackerPage> {
   Future<void> _loadHistory() async {
     final prefs = await SharedPreferences.getInstance();
     final shifts = await _store.load();
+    final activeId = prefs.getString(_activeShiftKey);
+    final graceMinutes = prefs.getInt(_shiftRecoveryGraceMinutesKey) ?? 120;
+    Shift? recoveredShift;
+    if (activeId != null) {
+      for (final shift in shifts) {
+        final recoverable =
+            shift.id == activeId &&
+            shift.endedAt == null &&
+            DateTime.now().difference(shift.lastActivityAt) <=
+                Duration(minutes: graceMinutes);
+        if (recoverable) {
+          recoveredShift = shift;
+          break;
+        }
+      }
+    }
     if (!mounted) return;
     setState(() {
       _batterySafeMode = prefs.getBool(_batterySafeModeKey) ?? true;
+      _shiftRecoveryGraceMinutes = graceMinutes;
+      if (recoveredShift != null) {
+        _activeShift = recoveredShift;
+        _lastKnownPoint = recoveredShift.points.isEmpty
+            ? null
+            : recoveredShift.points.last;
+        _status = 'Recovered active shift';
+        _now = DateTime.now();
+      }
       _savedShifts
         ..clear()
-        ..addAll(shifts);
+        ..addAll(shifts.where((shift) => shift.id != recoveredShift?.id));
     });
+    if (recoveredShift != null) {
+      _startRuntimeForRecoveredShift(recoveredShift);
+    }
+  }
+
+  Future<void> _startRuntimeForRecoveredShift(Shift shift) async {
+    await _showTrackingNotification();
+    _clock?.cancel();
+    _clock = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      setState(() => _now = DateTime.now());
+      _showTrackingNotification();
+    });
+    try {
+      _positionSub =
+          Geolocator.getPositionStream(
+            locationSettings: _locationSettings(),
+          ).listen(
+            _handlePosition,
+            onError: (error) => _recordGpsError(error.toString()),
+          );
+      _locationStreamStoppedMode = _stopDraft?.confirmed == true;
+      _logDiagnostic('Shift recovery', 'Recovered shift ${shift.id}');
+    } catch (error) {
+      _recordGpsError('Could not resume GPS stream: $error');
+    }
   }
 
   Future<void> _initNotifications() async {
@@ -184,14 +241,29 @@ class _TrackerPageState extends State<TrackerPage> {
     if (!allowed) return;
 
     final shift = Shift(
-        id: DateTime.now().millisecondsSinceEpoch.toString(),
-        startedAt: DateTime.now());
+      id: DateTime.now().millisecondsSinceEpoch.toString(),
+      startedAt: DateTime.now(),
+    );
+    shift.lifecycleEvents.add(
+      DeliveryLifecycleEvent(
+        stage: DeliveryLifecycleStage.shiftStarted,
+        timestamp: shift.startedAt,
+      ),
+    );
+    shift.lifecycleEvents.add(
+      DeliveryLifecycleEvent(
+        stage: DeliveryLifecycleStage.waitingForOrder,
+        timestamp: DateTime.now(),
+      ),
+    );
     setState(() {
       _activeShift = shift;
       _stopDraft = null;
       _status = 'Tracking active - waiting for GPS';
       _now = DateTime.now();
     });
+    await _markShiftActive(shift);
+    await _autosaveActiveShift(shift, force: true);
     unawaited(_primeCurrentLocation(shift));
 
     _clock?.cancel();
@@ -204,14 +276,16 @@ class _TrackerPageState extends State<TrackerPage> {
 
     final settings = _locationSettings();
     try {
-      _positionSub =
-          Geolocator.getPositionStream(locationSettings: settings).listen(
-        _handlePosition,
-        onError: (error) => _recordGpsError(error.toString()),
-      );
+      _positionSub = Geolocator.getPositionStream(locationSettings: settings)
+          .listen(
+            _handlePosition,
+            onError: (error) => _recordGpsError(error.toString()),
+          );
       _locationStreamStoppedMode = false;
       _logDiagnostic(
-          'Background service', 'Foreground location stream started');
+        'Background service',
+        'Foreground location stream started',
+      );
     } catch (_) {
       _clock?.cancel();
       _clock = null;
@@ -220,6 +294,40 @@ class _TrackerPageState extends State<TrackerPage> {
         _status = 'Could not start GPS tracking';
       });
     }
+  }
+
+  Future<void> _markShiftActive(Shift shift) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_activeShiftKey, shift.id);
+  }
+
+  Future<void> _clearActiveShiftMarker() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_activeShiftKey);
+  }
+
+  Future<bool> _confirmLeaveDuringShift() async {
+    if (!_isTracking || !mounted) return true;
+    final leave = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Shift still active'),
+        content: Text(
+          'Tracking will keep running and can be recovered for $_shiftRecoveryGraceMinutes minutes. Use Stop only when you really want to end the shift.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Stay'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Leave app'),
+          ),
+        ],
+      ),
+    );
+    return leave == true;
   }
 
   LocationSettings _locationSettings() {
@@ -245,10 +353,7 @@ class _TrackerPageState extends State<TrackerPage> {
       );
     }
 
-    return LocationSettings(
-      accuracy: accuracy,
-      distanceFilter: distanceFilter,
-    );
+    return LocationSettings(accuracy: accuracy, distanceFilter: distanceFilter);
   }
 
   Future<bool> _ensureLocationPermission() async {
@@ -271,8 +376,10 @@ class _TrackerPageState extends State<TrackerPage> {
     if (defaultTargetPlatform == TargetPlatform.android) {
       final notification = await permissions.Permission.notification.request();
       if (notification.isDenied || notification.isPermanentlyDenied) {
-        setState(() => _status =
-            'Notification permission is needed for background tracking');
+        setState(
+          () => _status =
+              'Notification permission is needed for background tracking',
+        );
         await _refreshPermissions();
         return false;
       }
@@ -342,8 +449,10 @@ class _TrackerPageState extends State<TrackerPage> {
         accuracy: position.accuracy,
         speedMetersPerSecond: max(0, position.speed),
       );
-      final filtered = _qualityCheckedPoint(point,
-          previous: shift.points.isEmpty ? null : shift.points.last);
+      final filtered = _qualityCheckedPoint(
+        point,
+        previous: shift.points.isEmpty ? null : shift.points.last,
+      );
       if (filtered == null) return;
       shift.points.add(filtered);
       _lastKnownPoint = filtered;
@@ -369,8 +478,10 @@ class _TrackerPageState extends State<TrackerPage> {
 
     final shift = _activeShift;
     if (shift == null) return;
-    final filtered = _qualityCheckedPoint(point,
-        previous: shift.points.isEmpty ? null : shift.points.last);
+    final filtered = _qualityCheckedPoint(
+      point,
+      previous: shift.points.isEmpty ? null : shift.points.last,
+    );
     if (filtered == null) return;
 
     StopEvent? newStop;
@@ -397,6 +508,7 @@ class _TrackerPageState extends State<TrackerPage> {
 
   Future<void> _autosaveActiveShift(Shift shift, {bool force = false}) async {
     final now = DateTime.now();
+    _closeEligibleDeliveryTrips(shift, now);
     if (!force &&
         _lastAutoSaveAt != null &&
         now.difference(_lastAutoSaveAt!) < const Duration(seconds: 30)) {
@@ -404,6 +516,21 @@ class _TrackerPageState extends State<TrackerPage> {
     }
     _lastAutoSaveAt = now;
     await _store.save(shift);
+  }
+
+  void _closeEligibleDeliveryTrips(Shift shift, DateTime now) {
+    for (final trip in shift.deliveryTrips) {
+      if (trip.endedAt != null) continue;
+      final eligibleAt = trip.eligibleForClosureAt;
+      final waiting =
+          shift.currentStage?.stage == DeliveryLifecycleStage.waitingForOrder;
+      if (trip.allOrdersDelivered &&
+          waiting &&
+          eligibleAt != null &&
+          !now.isBefore(eligibleAt)) {
+        trip.endedAt = now;
+      }
+    }
   }
 
   TrackPoint? _qualityCheckedPoint(TrackPoint point, {TrackPoint? previous}) {
@@ -453,9 +580,13 @@ class _TrackerPageState extends State<TrackerPage> {
     if (!mounted) return;
     setState(() {
       _diagnostics.insert(
-          0,
-          DiagnosticEntry(
-              title: title, message: message, timestamp: DateTime.now()));
+        0,
+        DiagnosticEntry(
+          title: title,
+          message: message,
+          timestamp: DateTime.now(),
+        ),
+      );
       if (_diagnostics.length > 20) {
         _diagnostics.removeRange(20, _diagnostics.length);
       }
@@ -467,16 +598,18 @@ class _TrackerPageState extends State<TrackerPage> {
     final shouldUseStoppedMode = _stopDraft?.confirmed == true;
     if (_locationStreamStoppedMode == shouldUseStoppedMode) return;
     _locationStreamStoppedMode = shouldUseStoppedMode;
-    await _positionSub
-        ?.cancel()
-        .timeout(const Duration(seconds: 3), onTimeout: () {});
+    await _positionSub?.cancel().timeout(
+      const Duration(seconds: 3),
+      onTimeout: () {},
+    );
     if (_activeShift == null) return;
     _positionSub =
-        Geolocator.getPositionStream(locationSettings: _locationSettings())
-            .listen(
-      _handlePosition,
-      onError: (error) => _recordGpsError(error.toString()),
-    );
+        Geolocator.getPositionStream(
+          locationSettings: _locationSettings(),
+        ).listen(
+          _handlePosition,
+          onError: (error) => _recordGpsError(error.toString()),
+        );
   }
 
   Future<void> _showTrackingNotification() async {
@@ -495,24 +628,37 @@ class _TrackerPageState extends State<TrackerPage> {
       showWhen: false,
       icon: 'ic_stat_delivery',
       actions: [
-        AndroidNotificationAction('stage_accepted', 'Accepted',
-            cancelNotification: false),
-        AndroidNotificationAction('stage_atRestaurant', 'At restaurant',
-            cancelNotification: false),
-        AndroidNotificationAction('stage_pickedUp', 'Picked up',
-            cancelNotification: false),
-        AndroidNotificationAction('stage_delivered', 'Delivered',
-            cancelNotification: false),
+        AndroidNotificationAction(
+          'stage_accepted',
+          'Accepted',
+          cancelNotification: false,
+        ),
+        AndroidNotificationAction(
+          'stage_atRestaurant',
+          'At restaurant',
+          cancelNotification: false,
+        ),
+        AndroidNotificationAction(
+          'stage_pickedUp',
+          'Picked up',
+          cancelNotification: false,
+        ),
+        AndroidNotificationAction(
+          'stage_delivered',
+          'Delivered',
+          cancelNotification: false,
+        ),
       ],
     );
     final time = formatDuration(shift.movingDuration);
     final distance = (shift.distanceMeters / 1000).toStringAsFixed(2);
     final mode = _batterySafeMode ? 'battery-safe' : 'high accuracy';
+    final activeOrders = shift.activeOrderCount;
     try {
       await _notifications.show(
         _trackingNotificationId,
         stage == null ? 'Delivery trip active' : stage.stage.label,
-        '$time - $distance km travelled - $mode',
+        '$activeOrders active orders - $time - $distance km - $mode',
         const NotificationDetails(android: androidDetails),
       );
     } catch (_) {
@@ -532,16 +678,31 @@ class _TrackerPageState extends State<TrackerPage> {
       showWhen: false,
       icon: 'ic_stat_delivery',
       actions: [
-        AndroidNotificationAction('stop_restaurant', 'Restaurant',
-            cancelNotification: true),
-        AndroidNotificationAction('stop_customer', 'Customer',
-            cancelNotification: true),
-        AndroidNotificationAction('stop_breakTime', 'Break',
-            cancelNotification: true),
-        AndroidNotificationAction('stop_waitingForOrder', 'Waiting',
-            cancelNotification: true),
-        AndroidNotificationAction('stop_other', 'Other',
-            cancelNotification: true),
+        AndroidNotificationAction(
+          'stop_restaurant',
+          'Restaurant',
+          cancelNotification: true,
+        ),
+        AndroidNotificationAction(
+          'stop_customer',
+          'Customer',
+          cancelNotification: true,
+        ),
+        AndroidNotificationAction(
+          'stop_breakTime',
+          'Break',
+          cancelNotification: true,
+        ),
+        AndroidNotificationAction(
+          'stop_waitingForOrder',
+          'Waiting',
+          cancelNotification: true,
+        ),
+        AndroidNotificationAction(
+          'stop_other',
+          'Other',
+          cancelNotification: true,
+        ),
       ],
     );
     try {
@@ -559,8 +720,9 @@ class _TrackerPageState extends State<TrackerPage> {
   void _handleNotificationResponse(NotificationResponse response) {
     final actionId = response.actionId ?? '';
     if (actionId.startsWith('stage_')) {
-      final stage =
-          DeliveryLifecycleStageX.fromName(actionId.substring('stage_'.length));
+      final stage = DeliveryLifecycleStageX.fromName(
+        actionId.substring('stage_'.length),
+      );
       if (stage != null) _recordLifecycleStage(stage);
       return;
     }
@@ -574,8 +736,10 @@ class _TrackerPageState extends State<TrackerPage> {
     final shift = _activeShift;
     if (shift == null) return;
     setState(() {
-      shift.lifecycleEvents
-          .add(DeliveryLifecycleEvent(stage: stage, timestamp: DateTime.now()));
+      shift.lifecycleEvents.add(
+        DeliveryLifecycleEvent(stage: stage, timestamp: DateTime.now()),
+      );
+      _applyLifecycleToTrip(shift, stage);
       _status = stage.statusText;
       _now = DateTime.now();
     });
@@ -583,11 +747,84 @@ class _TrackerPageState extends State<TrackerPage> {
     await _showTrackingNotification();
   }
 
+  void _applyLifecycleToTrip(Shift shift, DeliveryLifecycleStage stage) {
+    final now = DateTime.now();
+    shift.lastActivityAt = now;
+    switch (stage) {
+      case DeliveryLifecycleStage.shiftStarted:
+      case DeliveryLifecycleStage.shiftPaused:
+      case DeliveryLifecycleStage.shiftEnded:
+        return;
+      case DeliveryLifecycleStage.waitingForOrder:
+        final trip = shift.activeDeliveryTrip;
+        if (trip != null && trip.allOrdersDelivered && trip.endedAt == null) {
+          trip.eligibleForClosureAt = now.add(
+            Duration(minutes: shift.tripClosureGraceMinutes),
+          );
+        }
+        return;
+      case DeliveryLifecycleStage.orderAccepted:
+        final trip = shift.ensureActiveDeliveryTrip(now);
+        trip.eligibleForClosureAt = null;
+        trip.orders.add(
+          DeliveryOrder(
+            id: 'order-${now.millisecondsSinceEpoch}',
+            acceptedAt: now,
+            status: DeliveryOrderStatus.accepted,
+          ),
+        );
+        return;
+      case DeliveryLifecycleStage.travelingToRestaurant:
+      case DeliveryLifecycleStage.atRestaurant:
+        shift.ensureActiveDeliveryTrip(now).eligibleForClosureAt = null;
+        return;
+      case DeliveryLifecycleStage.orderPickedUp:
+        final trip = shift.ensureActiveDeliveryTrip(now);
+        final order = trip.latestOpenOrder;
+        if (order != null) {
+          order.status = DeliveryOrderStatus.pickedUp;
+          order.pickedUpAt = now;
+        }
+        return;
+      case DeliveryLifecycleStage.travelingToCustomer:
+        shift.ensureActiveDeliveryTrip(now).eligibleForClosureAt = null;
+        return;
+      case DeliveryLifecycleStage.delivered:
+        final trip = shift.ensureActiveDeliveryTrip(now);
+        final order = trip.latestUndeliveredOrder;
+        if (order != null) {
+          order.status = DeliveryOrderStatus.delivered;
+          order.deliveredAt = now;
+        }
+        if (trip.allOrdersDelivered) {
+          trip.eligibleForClosureAt = now.add(
+            Duration(minutes: shift.tripClosureGraceMinutes),
+          );
+        }
+        return;
+      case DeliveryLifecycleStage.multipleOrdersActive:
+      case DeliveryLifecycleStage.delayedAtRestaurant:
+      case DeliveryLifecycleStage.customerUnavailable:
+      case DeliveryLifecycleStage.orderCancelled:
+        shift.ensureActiveDeliveryTrip(now).eligibleForClosureAt = null;
+        if (stage == DeliveryLifecycleStage.orderCancelled) {
+          final order = shift.activeDeliveryTrip?.latestOpenOrder;
+          if (order != null) {
+            order.status = DeliveryOrderStatus.cancelled;
+            order.cancelledAt = now;
+          }
+        }
+        return;
+    }
+  }
+
   Future<void> _classifyLatestStop(StopType type) async {
     final shift = _activeShift;
     if (shift == null || shift.stops.isEmpty) return;
-    final stop = shift.stops.lastWhere((item) => item.type == StopType.other,
-        orElse: () => shift.stops.last);
+    final stop = shift.stops.lastWhere(
+      (item) => item.type == StopType.other,
+      orElse: () => shift.stops.last,
+    );
     setState(() {
       stop.type = type;
       _status = 'Stop marked as ${type.label}';
@@ -609,7 +846,8 @@ class _TrackerPageState extends State<TrackerPage> {
               leading: const Icon(Icons.pause_circle_rounded),
               title: const Text('Classify stop'),
               subtitle: Text(
-                  '${formatDuration(stop.duration)} at ${stop.placeLabel}'),
+                '${formatDuration(stop.duration)} at ${stop.placeLabel}',
+              ),
             ),
             ...StopType.values.map(
               (item) => ListTile(
@@ -642,8 +880,10 @@ class _TrackerPageState extends State<TrackerPage> {
       final draft = _stopDraft!;
       final distanceFromAnchor = haversineMeters(draft.anchor, point);
       if (distanceFromAnchor > _stopRadiusMeters) {
-        shift.segments.add(RouteSegment(startedAt: point.timestamp)
-          ..points.addAll([draft.anchor, point]));
+        shift.segments.add(
+          RouteSegment(startedAt: point.timestamp)
+            ..points.addAll([draft.anchor, point]),
+        );
         _stopDraft = null;
       }
       return;
@@ -661,12 +901,14 @@ class _TrackerPageState extends State<TrackerPage> {
           point.timestamp.difference(draft.startedAt) >= _stopAfter) {
         draft.confirmed = true;
         currentSegment.endedAt = draft.startedAt;
-        shift.stops.add(StopEvent(
-          latitude: draft.anchor.latitude,
-          longitude: draft.anchor.longitude,
-          startedAt: draft.startedAt,
-          endedAt: point.timestamp,
-        ));
+        shift.stops.add(
+          StopEvent(
+            latitude: draft.anchor.latitude,
+            longitude: draft.anchor.longitude,
+            startedAt: draft.startedAt,
+            endedAt: point.timestamp,
+          ),
+        );
       } else if (draft.confirmed && shift.stops.isNotEmpty) {
         shift.stops.last.endedAt = point.timestamp;
       }
@@ -677,8 +919,10 @@ class _TrackerPageState extends State<TrackerPage> {
       final draft = _stopDraft!;
       final distanceFromStop = haversineMeters(draft.anchor, point);
       if (distanceFromStop > _stopRadiusMeters) {
-        shift.segments.add(RouteSegment(startedAt: point.timestamp)
-          ..points.addAll([draft.anchor, point]));
+        shift.segments.add(
+          RouteSegment(startedAt: point.timestamp)
+            ..points.addAll([draft.anchor, point]),
+        );
         _stopDraft = null;
       }
     } else {
@@ -701,7 +945,10 @@ class _TrackerPageState extends State<TrackerPage> {
   void _changeSelectedDay(int days) {
     setState(() {
       _selectedDay = DateTime(
-          _selectedDay.year, _selectedDay.month, _selectedDay.day + days);
+        _selectedDay.year,
+        _selectedDay.month,
+        _selectedDay.day + days,
+      );
     });
   }
 
@@ -709,9 +956,9 @@ class _TrackerPageState extends State<TrackerPage> {
     final csv = shiftsToCsv(_selectedDayShifts);
     await Clipboard.setData(ClipboardData(text: csv));
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Day data copied as CSV')),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Day data copied as CSV')));
   }
 
   Future<void> _saveSelectedDayCsv() async {
@@ -728,9 +975,9 @@ class _TrackerPageState extends State<TrackerPage> {
     final file = File('${dir.path}${Platform.pathSeparator}$filename');
     await file.writeAsString(shiftsToCsv(shifts));
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('Saved CSV: $filename')),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text('Saved CSV: $filename')));
   }
 
   Future<void> _saveSelectedDayGpx() async {
@@ -754,13 +1001,14 @@ class _TrackerPageState extends State<TrackerPage> {
     required String contents,
     required String emptyMessage,
   }) async {
-    final hasPoints =
-        _selectedDayShifts.any((shift) => shift.points.isNotEmpty);
+    final hasPoints = _selectedDayShifts.any(
+      (shift) => shift.points.isNotEmpty,
+    );
     if (!hasPoints) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(emptyMessage)),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(emptyMessage)));
       return;
     }
     final dir = await getApplicationDocumentsDirectory();
@@ -796,7 +1044,8 @@ class _TrackerPageState extends State<TrackerPage> {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-            content: Text('Clipboard does not contain a JSON backup')),
+          content: Text('Clipboard does not contain a JSON backup'),
+        ),
       );
       return;
     }
@@ -818,14 +1067,17 @@ class _TrackerPageState extends State<TrackerPage> {
       builder: (context) => AlertDialog(
         title: const Text('Restore backup?'),
         content: Text(
-            'This will replace saved local shifts with ${shifts.length} restored shifts.'),
+          'This will replace saved local shifts with ${shifts.length} restored shifts.',
+        ),
         actions: [
           TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('Cancel')),
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
           FilledButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: const Text('Restore')),
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Restore'),
+          ),
         ],
       ),
     );
@@ -833,9 +1085,9 @@ class _TrackerPageState extends State<TrackerPage> {
     await _store.replaceAll(shifts);
     await _loadHistory();
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('Restored ${shifts.length} shifts')),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text('Restored ${shifts.length} shifts')));
   }
 
   Future<void> _setBatterySafeMode(bool value) async {
@@ -846,19 +1098,28 @@ class _TrackerPageState extends State<TrackerPage> {
 
     final shift = _activeShift;
     if (shift != null) {
-      await _positionSub
-          ?.cancel()
-          .timeout(const Duration(seconds: 3), onTimeout: () {});
+      await _positionSub?.cancel().timeout(
+        const Duration(seconds: 3),
+        onTimeout: () {},
+      );
       _locationStreamStoppedMode =
           _batterySafeMode && _stopDraft?.confirmed == true;
       _positionSub =
-          Geolocator.getPositionStream(locationSettings: _locationSettings())
-              .listen(
-        _handlePosition,
-        onError: (error) => _recordGpsError(error.toString()),
-      );
+          Geolocator.getPositionStream(
+            locationSettings: _locationSettings(),
+          ).listen(
+            _handlePosition,
+            onError: (error) => _recordGpsError(error.toString()),
+          );
       await _showTrackingNotification();
     }
+  }
+
+  Future<void> _setShiftRecoveryGraceMinutes(int minutes) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_shiftRecoveryGraceMinutesKey, minutes);
+    if (!mounted) return;
+    setState(() => _shiftRecoveryGraceMinutes = minutes);
   }
 
   Future<void> _pickCalendarDate() async {
@@ -877,15 +1138,18 @@ class _TrackerPageState extends State<TrackerPage> {
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Delete shift?'),
-        content:
-            Text(DateFormat('EEE, MMM d yyyy HH:mm').format(shift.startedAt)),
+        content: Text(
+          DateFormat('EEE, MMM d yyyy HH:mm').format(shift.startedAt),
+        ),
         actions: [
           TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('Cancel')),
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
           FilledButton(
             style: FilledButton.styleFrom(
-                backgroundColor: const Color(0xffdc2626)),
+              backgroundColor: const Color(0xffdc2626),
+            ),
             onPressed: () => Navigator.pop(context, true),
             child: const Text('Delete'),
           ),
@@ -898,11 +1162,13 @@ class _TrackerPageState extends State<TrackerPage> {
   }
 
   Future<void> _editTrip(Shift shift, RouteSegment segment) async {
-    final restaurantController =
-        TextEditingController(text: segment.pickupRestaurantName);
+    final restaurantController = TextEditingController(
+      text: segment.pickupRestaurantName,
+    );
     final earningsController = TextEditingController(
-      text:
-          segment.earnings == null ? '' : segment.earnings!.toStringAsFixed(2),
+      text: segment.earnings == null
+          ? ''
+          : segment.earnings!.toStringAsFixed(2),
     );
     var platform = segment.platform;
 
@@ -917,16 +1183,21 @@ class _TrackerPageState extends State<TrackerPage> {
               TextField(
                 controller: restaurantController,
                 textInputAction: TextInputAction.next,
-                decoration:
-                    const InputDecoration(labelText: 'Pickup restaurant name'),
+                decoration: const InputDecoration(
+                  labelText: 'Pickup restaurant name',
+                ),
               ),
               const SizedBox(height: 12),
               DropdownButtonFormField<DeliveryPlatform>(
                 initialValue: platform,
                 decoration: const InputDecoration(labelText: 'Platform'),
                 items: DeliveryPlatform.values
-                    .map((item) =>
-                        DropdownMenuItem(value: item, child: Text(item.label)))
+                    .map(
+                      (item) => DropdownMenuItem(
+                        value: item,
+                        child: Text(item.label),
+                      ),
+                    )
                     .toList(),
                 onChanged: (value) {
                   if (value != null) setDialogState(() => platform = value);
@@ -935,27 +1206,31 @@ class _TrackerPageState extends State<TrackerPage> {
               const SizedBox(height: 12),
               TextField(
                 controller: earningsController,
-                keyboardType:
-                    const TextInputType.numberWithOptions(decimal: true),
+                keyboardType: const TextInputType.numberWithOptions(
+                  decimal: true,
+                ),
                 decoration: const InputDecoration(labelText: 'Trip earnings'),
               ),
             ],
           ),
           actions: [
             TextButton(
-                onPressed: () => Navigator.pop(context, false),
-                child: const Text('Cancel')),
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel'),
+            ),
             FilledButton(
-                onPressed: () => Navigator.pop(context, true),
-                child: const Text('Save')),
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Save'),
+            ),
           ],
         ),
       ),
     );
 
     if (saved != true) return;
-    final earnings =
-        double.tryParse(earningsController.text.trim().replaceAll(',', '.'));
+    final earnings = double.tryParse(
+      earningsController.text.trim().replaceAll(',', '.'),
+    );
     setState(() {
       segment.pickupRestaurantName = restaurantController.text.trim();
       segment.platform = platform;
@@ -966,8 +1241,9 @@ class _TrackerPageState extends State<TrackerPage> {
   }
 
   Future<void> _editStopLabel(StopEvent stop) async {
-    final restaurantController =
-        TextEditingController(text: stop.restaurantName);
+    final restaurantController = TextEditingController(
+      text: stop.restaurantName,
+    );
     final placeController = TextEditingController(text: stop.placeName);
     final noteController = TextEditingController(text: stop.note);
     var type = stop.type;
@@ -984,8 +1260,12 @@ class _TrackerPageState extends State<TrackerPage> {
                 initialValue: type,
                 decoration: const InputDecoration(labelText: 'Stop type'),
                 items: StopType.values
-                    .map((item) =>
-                        DropdownMenuItem(value: item, child: Text(item.label)))
+                    .map(
+                      (item) => DropdownMenuItem(
+                        value: item,
+                        child: Text(item.label),
+                      ),
+                    )
                     .toList(),
                 onChanged: (value) {
                   if (value != null) setDialogState(() => type = value);
@@ -995,7 +1275,8 @@ class _TrackerPageState extends State<TrackerPage> {
                 controller: restaurantController,
                 textInputAction: TextInputAction.next,
                 decoration: const InputDecoration(
-                    labelText: 'Restaurant or pickup name'),
+                  labelText: 'Restaurant or pickup name',
+                ),
               ),
               TextField(
                 controller: placeController,
@@ -1011,11 +1292,13 @@ class _TrackerPageState extends State<TrackerPage> {
           ),
           actions: [
             TextButton(
-                onPressed: () => Navigator.pop(context, false),
-                child: const Text('Cancel')),
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel'),
+            ),
             FilledButton(
-                onPressed: () => Navigator.pop(context, true),
-                child: const Text('Save')),
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Save'),
+            ),
           ],
         ),
       ),
@@ -1065,9 +1348,10 @@ class _TrackerPageState extends State<TrackerPage> {
       _now = DateTime.now();
     });
 
-    await _positionSub
-        ?.cancel()
-        .timeout(const Duration(seconds: 3), onTimeout: () {});
+    await _positionSub?.cancel().timeout(
+      const Duration(seconds: 3),
+      onTimeout: () {},
+    );
     _positionSub = null;
     _locationStreamStoppedMode = false;
     _clock?.cancel();
@@ -1079,48 +1363,85 @@ class _TrackerPageState extends State<TrackerPage> {
     }
 
     shift.endedAt = DateTime.now();
+    shift.lastActivityAt = shift.endedAt!;
+    shift.lifecycleEvents.add(
+      DeliveryLifecycleEvent(
+        stage: DeliveryLifecycleStage.shiftEnded,
+        timestamp: shift.endedAt!,
+      ),
+    );
+    for (final trip in shift.deliveryTrips.where(
+      (trip) => trip.endedAt == null,
+    )) {
+      if (trip.allOrdersDelivered) {
+        trip.endedAt = shift.endedAt;
+      }
+    }
     if (shift.segments.isNotEmpty && shift.segments.last.endedAt == null) {
       shift.segments.last.endedAt = shift.endedAt;
     }
     await _store.save(shift);
+    await _clearActiveShiftMarker();
     await _loadHistory();
 
     if (!mounted) return;
-    setState(() => _status = shift.segments.isEmpty
-        ? 'Shift saved without movement'
-        : 'Shift saved');
+    setState(
+      () => _status = shift.segments.isEmpty
+          ? 'Shift saved without movement'
+          : 'Shift saved',
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     final shift = _activeShift;
-    return Scaffold(
-      appBar: AppBar(
-        title: Text(['Tracker', 'Calendar', 'Earnings', 'Settings'][_tabIndex]),
-        surfaceTintColor: Colors.transparent,
-      ),
-      body: IndexedStack(
-        index: _tabIndex,
-        children: [
-          _buildTrackerTab(shift),
-          _buildCalendarTab(),
-          _buildEarningsTab(),
-          _buildSettingsTab(),
-        ],
-      ),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _tabIndex,
-        onDestinationSelected: (index) => setState(() => _tabIndex = index),
-        destinations: const [
-          NavigationDestination(
-              icon: Icon(Icons.route_rounded), label: 'Tracker'),
-          NavigationDestination(
-              icon: Icon(Icons.calendar_month_rounded), label: 'Calendar'),
-          NavigationDestination(
-              icon: Icon(Icons.payments_rounded), label: 'Earnings'),
-          NavigationDestination(
-              icon: Icon(Icons.settings_rounded), label: 'Settings'),
-        ],
+    return PopScope(
+      canPop: !_isTracking,
+      onPopInvokedWithResult: (didPop, result) async {
+        if (didPop) return;
+        final leave = await _confirmLeaveDuringShift();
+        if (leave && context.mounted) {
+          Navigator.of(context).pop();
+        }
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          title: Text(
+            ['Tracker', 'Calendar', 'Earnings', 'Settings'][_tabIndex],
+          ),
+          surfaceTintColor: Colors.transparent,
+        ),
+        body: IndexedStack(
+          index: _tabIndex,
+          children: [
+            _buildTrackerTab(shift),
+            _buildCalendarTab(),
+            _buildEarningsTab(),
+            _buildSettingsTab(),
+          ],
+        ),
+        bottomNavigationBar: NavigationBar(
+          selectedIndex: _tabIndex,
+          onDestinationSelected: (index) => setState(() => _tabIndex = index),
+          destinations: const [
+            NavigationDestination(
+              icon: Icon(Icons.route_rounded),
+              label: 'Tracker',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.calendar_month_rounded),
+              label: 'Calendar',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.payments_rounded),
+              label: 'Earnings',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.settings_rounded),
+              label: 'Settings',
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1129,11 +1450,12 @@ class _TrackerPageState extends State<TrackerPage> {
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
       children: [
-        Text(_status,
-            style: Theme.of(context)
-                .textTheme
-                .labelLarge
-                ?.copyWith(color: const Color(0xff0f766e))),
+        Text(
+          _status,
+          style: Theme.of(
+            context,
+          ).textTheme.labelLarge?.copyWith(color: const Color(0xff0f766e)),
+        ),
         const SizedBox(height: 12),
         Row(
           children: [
@@ -1148,7 +1470,8 @@ class _TrackerPageState extends State<TrackerPage> {
             Expanded(
               child: FilledButton.icon(
                 style: FilledButton.styleFrom(
-                    backgroundColor: const Color(0xffdc2626)),
+                  backgroundColor: const Color(0xffdc2626),
+                ),
                 onPressed: _isTracking ? _stopShift : null,
                 icon: const Icon(Icons.stop_rounded),
                 label: const Text('Stop'),
@@ -1157,10 +1480,7 @@ class _TrackerPageState extends State<TrackerPage> {
           ],
         ),
         const SizedBox(height: 14),
-        _LifecyclePanel(
-          shift: shift,
-          onStage: _recordLifecycleStage,
-        ),
+        _LifecyclePanel(shift: shift, onStage: _recordLifecycleStage),
         const SizedBox(height: 14),
         SizedBox(
           height: 300,
@@ -1170,8 +1490,9 @@ class _TrackerPageState extends State<TrackerPage> {
               border: Border.all(color: Theme.of(context).dividerColor),
             ),
             child: RoutePreview(
-                points: shift?.points ?? const [],
-                lastKnownPoint: _lastKnownPoint),
+              points: shift?.points ?? const [],
+              lastKnownPoint: _lastKnownPoint,
+            ),
           ),
         ),
         const SizedBox(height: 12),
@@ -1204,14 +1525,18 @@ class _TrackerPageState extends State<TrackerPage> {
           onDeleteShift: _deleteShift,
         ),
         const SizedBox(height: 22),
-        Text('All saved shifts',
-            style: Theme.of(context).textTheme.titleMedium),
+        Text(
+          'All saved shifts',
+          style: Theme.of(context).textTheme.titleMedium,
+        ),
         const SizedBox(height: 8),
         if (_savedShifts.isEmpty)
           const Text('No saved shifts yet.')
         else
-          ..._savedShifts.map((item) =>
-              _HistoryTile(shift: item, onDelete: () => _deleteShift(item))),
+          ..._savedShifts.map(
+            (item) =>
+                _HistoryTile(shift: item, onDelete: () => _deleteShift(item)),
+          ),
       ],
     );
   }
@@ -1233,8 +1558,10 @@ class _TrackerPageState extends State<TrackerPage> {
       children: [
         Row(
           children: [
-            Text('Daily earnings',
-                style: Theme.of(context).textTheme.titleMedium),
+            Text(
+              'Daily earnings',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
             const Spacer(),
             IconButton(
               tooltip: 'Previous day',
@@ -1274,7 +1601,8 @@ class _TrackerPageState extends State<TrackerPage> {
             leading: const Icon(Icons.info_outline_rounded),
             title: const Text('Uber Eats deduction'),
             subtitle: Text(
-                'Gross ${formatMoney(uberGross)} x 74.5% = ${formatMoney(uberNet)}'),
+              'Gross ${formatMoney(uberGross)} x 74.5% = ${formatMoney(uberNet)}',
+            ),
           ),
         ),
         const SizedBox(height: 12),
@@ -1297,17 +1625,40 @@ class _TrackerPageState extends State<TrackerPage> {
       children: [
         SwitchListTile(
           title: const Text('Dark mode'),
-          subtitle:
-              const Text('Use a darker interface during delivery shifts.'),
+          subtitle: const Text(
+            'Use a darker interface during delivery shifts.',
+          ),
           value: widget.darkMode,
           onChanged: widget.onDarkModeChanged,
         ),
         SwitchListTile(
           title: const Text('Battery-safe tracking'),
           subtitle: const Text(
-              'Uses high accuracy while moving and lower GPS frequency while stopped.'),
+            'Uses high accuracy while moving and lower GPS frequency while stopped.',
+          ),
           value: _batterySafeMode,
           onChanged: _setBatterySafeMode,
+        ),
+        Card(
+          child: ListTile(
+            leading: const Icon(Icons.restore_page_rounded),
+            title: const Text('Shift recovery grace period'),
+            subtitle: Text(
+              'Resume an accidentally closed active shift for $_shiftRecoveryGraceMinutes minutes.',
+            ),
+            trailing: DropdownButton<int>(
+              value: _shiftRecoveryGraceMinutes,
+              items: const [
+                DropdownMenuItem(value: 30, child: Text('30m')),
+                DropdownMenuItem(value: 60, child: Text('1h')),
+                DropdownMenuItem(value: 120, child: Text('2h')),
+                DropdownMenuItem(value: 240, child: Text('4h')),
+              ],
+              onChanged: (value) {
+                if (value != null) _setShiftRecoveryGraceMinutes(value);
+              },
+            ),
+          ),
         ),
         const SizedBox(height: 12),
         _PermissionPanel(
@@ -1321,9 +1672,11 @@ class _TrackerPageState extends State<TrackerPage> {
           child: ListTile(
             leading: const Icon(Icons.health_and_safety_rounded),
             title: const Text('Run diagnosis'),
-            subtitle: Text(_permissions.requiredGranted
-                ? 'Required permissions are ready.'
-                : 'Some required permissions need attention.'),
+            subtitle: Text(
+              _permissions.requiredGranted
+                  ? 'Required permissions are ready.'
+                  : 'Some required permissions need attention.',
+            ),
             trailing: const Icon(Icons.chevron_right_rounded),
             onTap: _refreshPermissions,
           ),
@@ -1333,7 +1686,8 @@ class _TrackerPageState extends State<TrackerPage> {
             leading: const Icon(Icons.folder_rounded),
             title: const Text('Local CSV storage'),
             subtitle: const Text(
-                'CSV files are saved in the app documents folder without broad file access.'),
+              'CSV files are saved in the app documents folder without broad file access.',
+            ),
             trailing: const Icon(Icons.save_alt_rounded),
             onTap: _saveSelectedDayCsv,
           ),
@@ -1342,8 +1696,9 @@ class _TrackerPageState extends State<TrackerPage> {
           child: ListTile(
             leading: const Icon(Icons.map_rounded),
             title: const Text('Export GPX route'),
-            subtitle:
-                const Text('Saves the selected day for mapping and GIS tools.'),
+            subtitle: const Text(
+              'Saves the selected day for mapping and GIS tools.',
+            ),
             trailing: const Icon(Icons.alt_route_rounded),
             onTap: _saveSelectedDayGpx,
           ),
@@ -1362,7 +1717,8 @@ class _TrackerPageState extends State<TrackerPage> {
             leading: const Icon(Icons.backup_rounded),
             title: const Text('Export JSON backup'),
             subtitle: const Text(
-                'Saves full app data and copies the backup JSON to clipboard.'),
+              'Saves full app data and copies the backup JSON to clipboard.',
+            ),
             trailing: const Icon(Icons.ios_share_rounded),
             onTap: _exportJsonBackup,
           ),
@@ -1372,7 +1728,8 @@ class _TrackerPageState extends State<TrackerPage> {
             leading: const Icon(Icons.restore_rounded),
             title: const Text('Restore JSON backup'),
             subtitle: const Text(
-                'Paste or copy a backup JSON first, then restore from clipboard.'),
+              'Paste or copy a backup JSON first, then restore from clipboard.',
+            ),
             trailing: const Icon(Icons.content_paste_go_rounded),
             onTap: _restoreJsonBackupFromClipboard,
           ),
@@ -1420,8 +1777,10 @@ class _PermissionPanel extends StatelessWidget {
           children: [
             Row(
               children: [
-                Text('Permissions',
-                    style: Theme.of(context).textTheme.titleSmall),
+                Text(
+                  'Permissions',
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
                 const Spacer(),
                 IconButton(
                   tooltip: 'Refresh permissions',
@@ -1431,17 +1790,21 @@ class _PermissionPanel extends StatelessWidget {
               ],
             ),
             _PermissionRow(
-                label: 'Location services',
-                granted: permissions.locationServices),
+              label: 'Location services',
+              granted: permissions.locationServices,
+            ),
             _PermissionRow(
-                label: 'Location permission',
-                granted: permissions.locationGranted),
+              label: 'Location permission',
+              granted: permissions.locationGranted,
+            ),
             _PermissionRow(
-                label: 'Notification permission',
-                granted: permissions.notificationGranted),
+              label: 'Notification permission',
+              granted: permissions.notificationGranted,
+            ),
             _PermissionRow(
-                label: 'Overlay permission',
-                granted: permissions.overlayGranted),
+              label: 'Overlay permission',
+              granted: permissions.overlayGranted,
+            ),
             const SizedBox(height: 8),
             Row(
               children: [
@@ -1488,8 +1851,10 @@ class _PermissionRow extends StatelessWidget {
           ),
           const SizedBox(width: 8),
           Expanded(child: Text(label)),
-          Text(granted ? 'On' : 'Off',
-              style: Theme.of(context).textTheme.labelMedium),
+          Text(
+            granted ? 'On' : 'Off',
+            style: Theme.of(context).textTheme.labelMedium,
+          ),
         ],
       ),
     );
@@ -1521,29 +1886,35 @@ class _DiagnosticsPanel extends StatelessWidget {
       child: ExpansionTile(
         leading: const Icon(Icons.bug_report_rounded),
         title: const Text('Diagnostics'),
-        subtitle: Text(trackingActive
-            ? 'Background tracking service is active'
-            : 'Background tracking service is inactive'),
+        subtitle: Text(
+          trackingActive
+              ? 'Background tracking service is active'
+              : 'Background tracking service is inactive',
+        ),
         children: [
           _DiagnosticRow(label: 'Latest GPS error', value: lastGpsError),
           _DiagnosticRow(
-              label: 'Location permission',
-              value: permissions.locationGranted ? 'Granted' : 'Missing'),
+            label: 'Location permission',
+            value: permissions.locationGranted ? 'Granted' : 'Missing',
+          ),
           _DiagnosticRow(
-              label: 'Notification status',
-              value: notificationsReady && permissions.notificationGranted
-                  ? 'Ready'
-                  : 'Needs attention'),
+            label: 'Notification status',
+            value: notificationsReady && permissions.notificationGranted
+                ? 'Ready'
+                : 'Needs attention',
+          ),
           _DiagnosticRow(
-              label: 'Service status',
-              value: trackingActive
-                  ? (backgroundStoppedMode
+            label: 'Service status',
+            value: trackingActive
+                ? (backgroundStoppedMode
                       ? 'Active, stopped mode'
                       : 'Active, moving mode')
-                  : 'Inactive'),
+                : 'Inactive',
+          ),
           _DiagnosticRow(
-              label: 'Battery-safe mode',
-              value: batterySafeMode ? 'On' : 'Off'),
+            label: 'Battery-safe mode',
+            value: batterySafeMode ? 'On' : 'Off',
+          ),
           if (diagnostics.isEmpty)
             const ListTile(title: Text('No recent diagnostic events.'))
           else
@@ -1553,7 +1924,8 @@ class _DiagnosticsPanel extends StatelessWidget {
                 leading: const Icon(Icons.notes_rounded),
                 title: Text(entry.title),
                 subtitle: Text(
-                    '${DateFormat('HH:mm:ss').format(entry.timestamp)} - ${entry.message}'),
+                  '${DateFormat('HH:mm:ss').format(entry.timestamp)} - ${entry.message}',
+                ),
               ),
             ),
         ],
@@ -1570,11 +1942,7 @@ class _DiagnosticRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ListTile(
-      dense: true,
-      title: Text(label),
-      subtitle: Text(value),
-    );
+    return ListTile(dense: true, title: Text(label), subtitle: Text(value));
   }
 }
 
@@ -1595,16 +1963,20 @@ class _StatsGrid extends StatelessWidget {
       crossAxisSpacing: 8,
       children: [
         _StatCard(
-            label: 'Distance',
-            value:
-                '${((shift?.distanceMeters ?? 0) / 1000).toStringAsFixed(2)} km'),
+          label: 'Distance',
+          value:
+              '${((shift?.distanceMeters ?? 0) / 1000).toStringAsFixed(2)} km',
+        ),
         _StatCard(
-            label: 'Moving time',
-            value: formatDuration(
-                shift?.movingDurationUntil(now) ?? Duration.zero)),
+          label: 'Moving time',
+          value: formatDuration(
+            shift?.movingDurationUntil(now) ?? Duration.zero,
+          ),
+        ),
         _StatCard(
-            label: 'Wait time',
-            value: formatDuration(shift?.waitDuration ?? Duration.zero)),
+          label: 'Wait time',
+          value: formatDuration(shift?.waitDuration ?? Duration.zero),
+        ),
         _StatCard(label: 'Stops', value: '${shift?.stops.length ?? 0}'),
       ],
     );
@@ -1612,10 +1984,7 @@ class _StatsGrid extends StatelessWidget {
 }
 
 class _LifecyclePanel extends StatelessWidget {
-  const _LifecyclePanel({
-    required this.shift,
-    required this.onStage,
-  });
+  const _LifecyclePanel({required this.shift, required this.onStage});
 
   final Shift? shift;
   final ValueChanged<DeliveryLifecycleStage> onStage;
@@ -1623,6 +1992,13 @@ class _LifecyclePanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final current = shift?.currentStage?.stage;
+    final trip = shift?.activeDeliveryTrip;
+    final history = (shift?.lifecycleEvents ?? const <DeliveryLifecycleEvent>[])
+        .reversed
+        .take(8)
+        .toList()
+        .reversed
+        .toList();
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(12),
@@ -1633,34 +2009,94 @@ class _LifecyclePanel extends StatelessWidget {
               children: [
                 const Icon(Icons.delivery_dining_rounded),
                 const SizedBox(width: 8),
-                Text('Delivery lifecycle',
-                    style: Theme.of(context).textTheme.titleSmall),
+                Text(
+                  'Delivery lifecycle',
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
                 const Spacer(),
-                Text(current?.label ?? 'Not started',
-                    style: Theme.of(context).textTheme.labelMedium),
+                Text(
+                  current?.label ?? 'Not started',
+                  style: Theme.of(context).textTheme.labelMedium,
+                ),
               ],
             ),
             const SizedBox(height: 10),
             Wrap(
               spacing: 8,
               runSpacing: 8,
-              children: DeliveryLifecycleStage.values.map((stage) {
-                final selected = current == stage;
-                return ActionChip(
-                  avatar: Icon(stage.icon, size: 18),
-                  label: Text(stage.label),
-                  onPressed: shift == null ? null : () => onStage(stage),
-                  backgroundColor: selected
-                      ? Theme.of(context).colorScheme.primaryContainer
-                      : null,
-                  labelStyle: selected
-                      ? TextStyle(
-                          color:
-                              Theme.of(context).colorScheme.onPrimaryContainer)
-                      : null,
-                );
-              }).toList(),
+              children: [
+                _MiniMetric(
+                  label: 'Active orders',
+                  value: '${shift?.activeOrderCount ?? 0}',
+                ),
+                _MiniMetric(
+                  label: 'Trip ID',
+                  value: trip?.id.split('-').last ?? '-',
+                ),
+                _MiniMetric(
+                  label: 'Trip start',
+                  value: trip == null
+                      ? '-'
+                      : DateFormat('HH:mm').format(trip.startedAt),
+                ),
+                _MiniMetric(
+                  label: 'Active time',
+                  value: trip == null
+                      ? '0m 00s'
+                      : formatDuration(
+                          DateTime.now().difference(trip.startedAt),
+                        ),
+                ),
+                _MiniMetric(
+                  label: 'Distance',
+                  value:
+                      '${((shift?.distanceMeters ?? 0) / 1000).toStringAsFixed(2)} km',
+                ),
+              ],
             ),
+            const SizedBox(height: 10),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: DeliveryLifecycleStage.values
+                  .where((stage) => stage != DeliveryLifecycleStage.shiftEnded)
+                  .map((stage) {
+                    final selected = current == stage;
+                    return ActionChip(
+                      avatar: Icon(stage.icon, size: 18),
+                      label: Text(stage.label),
+                      onPressed: shift == null ? null : () => onStage(stage),
+                      backgroundColor: selected
+                          ? Theme.of(context).colorScheme.primaryContainer
+                          : null,
+                      labelStyle: selected
+                          ? TextStyle(
+                              color: Theme.of(
+                                context,
+                              ).colorScheme.onPrimaryContainer,
+                            )
+                          : null,
+                    );
+                  })
+                  .toList(),
+            ),
+            if (history.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              Text(
+                'Status history',
+                style: Theme.of(context).textTheme.labelLarge,
+              ),
+              const SizedBox(height: 4),
+              ...history.map(
+                (event) => Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 2),
+                  child: Text(
+                    '${DateFormat('HH:mm').format(event.timestamp)} - ${event.stage.label}',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ),
+              ),
+            ],
           ],
         ),
       ),
@@ -1688,16 +2124,18 @@ class _StatCard extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Text(label,
-                style: Theme.of(context)
-                    .textTheme
-                    .labelMedium
-                    ?.copyWith(color: const Color(0xff6b7280))),
-            Text(value,
-                style: Theme.of(context)
-                    .textTheme
-                    .titleMedium
-                    ?.copyWith(fontWeight: FontWeight.w700)),
+            Text(
+              label,
+              style: Theme.of(
+                context,
+              ).textTheme.labelMedium?.copyWith(color: const Color(0xff6b7280)),
+            ),
+            Text(
+              value,
+              style: Theme.of(
+                context,
+              ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+            ),
           ],
         ),
       ),
@@ -1714,15 +2152,25 @@ class _PerformanceSummary extends StatelessWidget {
   Widget build(BuildContext context) {
     final trips = shifts.expand((shift) => shift.segments).toList();
     final totalWork = shifts.fold<Duration>(
-        Duration.zero, (sum, shift) => sum + shift.duration);
+      Duration.zero,
+      (sum, shift) => sum + shift.duration,
+    );
     final totalMoving = shifts.fold<Duration>(
-        Duration.zero, (sum, shift) => sum + shift.movingDuration);
+      Duration.zero,
+      (sum, shift) => sum + shift.movingDuration,
+    );
     final totalWaiting = shifts.fold<Duration>(
-        Duration.zero, (sum, shift) => sum + shift.waitDuration);
-    final distanceMeters =
-        shifts.fold<double>(0, (sum, shift) => sum + shift.distanceMeters);
-    final totalNet =
-        shifts.fold<double>(0, (sum, shift) => sum + shift.netEarnings);
+      Duration.zero,
+      (sum, shift) => sum + shift.waitDuration,
+    );
+    final distanceMeters = shifts.fold<double>(
+      0,
+      (sum, shift) => sum + shift.distanceMeters,
+    );
+    final totalNet = shifts.fold<double>(
+      0,
+      (sum, shift) => sum + shift.netEarnings,
+    );
     final hours = totalWork.inSeconds / 3600;
     final km = distanceMeters / 1000;
     final woltNet = trips
@@ -1742,8 +2190,10 @@ class _PerformanceSummary extends StatelessWidget {
               children: [
                 const Icon(Icons.analytics_rounded),
                 const SizedBox(width: 8),
-                Text('Performance',
-                    style: Theme.of(context).textTheme.titleSmall),
+                Text(
+                  'Performance',
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
               ],
             ),
             const SizedBox(height: 10),
@@ -1752,20 +2202,30 @@ class _PerformanceSummary extends StatelessWidget {
               runSpacing: 8,
               children: [
                 _MiniMetric(
-                    label: 'Total hours', value: formatDuration(totalWork)),
+                  label: 'Total hours',
+                  value: formatDuration(totalWork),
+                ),
                 _MiniMetric(
-                    label: 'Moving', value: formatDuration(totalMoving)),
+                  label: 'Moving',
+                  value: formatDuration(totalMoving),
+                ),
                 _MiniMetric(
-                    label: 'Waiting', value: formatDuration(totalWaiting)),
+                  label: 'Waiting',
+                  value: formatDuration(totalWaiting),
+                ),
                 _MiniMetric(
-                    label: 'Distance', value: '${km.toStringAsFixed(2)} km'),
+                  label: 'Distance',
+                  value: '${km.toStringAsFixed(2)} km',
+                ),
                 _MiniMetric(label: 'Net', value: formatMoney(totalNet)),
                 _MiniMetric(
-                    label: 'Per hour',
-                    value: hours <= 0 ? '0.00' : formatMoney(totalNet / hours)),
+                  label: 'Per hour',
+                  value: hours <= 0 ? '0.00' : formatMoney(totalNet / hours),
+                ),
                 _MiniMetric(
-                    label: 'Per km',
-                    value: km <= 0 ? '0.00' : formatMoney(totalNet / km)),
+                  label: 'Per km',
+                  value: km <= 0 ? '0.00' : formatMoney(totalNet / km),
+                ),
                 _MiniMetric(label: 'Wolt net', value: formatMoney(woltNet)),
                 _MiniMetric(label: 'Uber net', value: formatMoney(uberNet)),
               ],
@@ -1798,11 +2258,12 @@ class _MiniMetric extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(label, style: Theme.of(context).textTheme.labelSmall),
-              Text(value,
-                  style: Theme.of(context)
-                      .textTheme
-                      .titleSmall
-                      ?.copyWith(fontWeight: FontWeight.w700)),
+              Text(
+                value,
+                style: Theme.of(
+                  context,
+                ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
+              ),
             ],
           ),
         ),
@@ -1833,8 +2294,11 @@ class _RouteVerificationPanel extends StatelessWidget {
     for (final shift in shifts) {
       for (var i = 0; i < shift.segments.length; i++) {
         if (!shift.segments[i].reviewed) {
-          tripItems
-              .add((shift: shift, segment: shift.segments[i], index: i + 1));
+          tripItems.add((
+            shift: shift,
+            segment: shift.segments[i],
+            index: i + 1,
+          ));
         }
       }
       for (var i = 0; i < shift.stops.length; i++) {
@@ -1847,11 +2311,14 @@ class _RouteVerificationPanel extends StatelessWidget {
     return Card(
       child: ExpansionTile(
         leading: Icon(
-            total == 0 ? Icons.verified_rounded : Icons.fact_check_rounded),
+          total == 0 ? Icons.verified_rounded : Icons.fact_check_rounded,
+        ),
         title: const Text('Route verification'),
-        subtitle: Text(total == 0
-            ? 'All detected trips and stops are reviewed'
-            : '$total items need review'),
+        subtitle: Text(
+          total == 0
+              ? 'All detected trips and stops are reviewed'
+              : '$total items need review',
+        ),
         children: [
           if (total == 0)
             const ListTile(title: Text('Nothing to confirm for this day.'))
@@ -1883,7 +2350,8 @@ class _RouteVerificationPanel extends StatelessWidget {
                 leading: Icon(item.stop.type.icon),
                 title: Text('Stop ${item.index}: ${item.stop.displayName}'),
                 subtitle: Text(
-                    '${item.stop.type.label} - ${formatDuration(item.stop.duration)}'),
+                  '${item.stop.type.label} - ${formatDuration(item.stop.duration)}',
+                ),
                 trailing: Wrap(
                   spacing: 4,
                   children: [
@@ -1952,11 +2420,15 @@ class _TimelinePlaybackState extends State<_TimelinePlayback> {
               children: [
                 const Icon(Icons.play_circle_outline_rounded),
                 const SizedBox(width: 8),
-                Text('Timeline playback',
-                    style: Theme.of(context).textTheme.titleSmall),
+                Text(
+                  'Timeline playback',
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
                 const Spacer(),
-                Text('${_index + 1}/${points.length}',
-                    style: Theme.of(context).textTheme.labelMedium),
+                Text(
+                  '${_index + 1}/${points.length}',
+                  style: Theme.of(context).textTheme.labelMedium,
+                ),
               ],
             ),
             const SizedBox(height: 10),
@@ -1966,13 +2438,17 @@ class _TimelinePlaybackState extends State<_TimelinePlayback> {
                 borderRadius: BorderRadius.circular(8),
                 child: FlutterMap(
                   key: ValueKey(
-                      'playback-${selected.timestamp.toIso8601String()}'),
+                    'playback-${selected.timestamp.toIso8601String()}',
+                  ),
                   options: MapOptions(
-                    initialCenter:
-                        LatLng(selected.latitude, selected.longitude),
+                    initialCenter: LatLng(
+                      selected.latitude,
+                      selected.longitude,
+                    ),
                     initialZoom: visible.length > 1 ? 14 : 13,
                     interactionOptions: const InteractionOptions(
-                      flags: InteractiveFlag.drag |
+                      flags:
+                          InteractiveFlag.drag |
                           InteractiveFlag.pinchZoom |
                           InteractiveFlag.doubleTapZoom,
                     ),
@@ -1987,9 +2463,10 @@ class _TimelinePlaybackState extends State<_TimelinePlayback> {
                       PolylineLayer(
                         polylines: [
                           Polyline(
-                              points: visible,
-                              color: const Color(0xff0f766e),
-                              strokeWidth: 4),
+                            points: visible,
+                            color: const Color(0xff0f766e),
+                            strokeWidth: 4,
+                          ),
                         ],
                       ),
                     MarkerLayer(
@@ -2001,8 +2478,11 @@ class _TimelinePlaybackState extends State<_TimelinePlayback> {
                           child: GestureDetector(
                             onTap: () =>
                                 _showPointDetails(context, selected, status),
-                            child: const Icon(Icons.location_on_rounded,
-                                color: Color(0xffdc2626), size: 38),
+                            child: const Icon(
+                              Icons.location_on_rounded,
+                              color: Color(0xffdc2626),
+                              size: 38,
+                            ),
                           ),
                         ),
                       ],
@@ -2033,7 +2513,10 @@ class _TimelinePlaybackState extends State<_TimelinePlayback> {
   }
 
   void _showPointDetails(
-      BuildContext context, TrackPoint point, String status) {
+    BuildContext context,
+    TrackPoint point,
+    String status,
+  ) {
     showModalBottomSheet<void>(
       context: context,
       showDragHandle: true,
@@ -2071,9 +2554,10 @@ class _Timeline extends StatelessWidget {
           color: Theme.of(context).colorScheme.surface,
           margin: const EdgeInsets.only(bottom: 8),
           child: ListTile(
-            leading: Icon(entry.isStop ? Icons.pause_circle : Icons.route,
-                color:
-                    entry.isStop ? Colors.amber[800] : const Color(0xff0f766e)),
+            leading: Icon(
+              entry.isStop ? Icons.pause_circle : Icons.route,
+              color: entry.isStop ? Colors.amber[800] : const Color(0xff0f766e),
+            ),
             title: Text(entry.title),
             subtitle: Text(entry.subtitle),
             trailing: entry.stop == null
@@ -2123,14 +2607,22 @@ class _DayView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final totalDistance =
-        shifts.fold<double>(0, (sum, shift) => sum + shift.distanceMeters);
+    final totalDistance = shifts.fold<double>(
+      0,
+      (sum, shift) => sum + shift.distanceMeters,
+    );
     final totalWait = shifts.fold<Duration>(
-        Duration.zero, (sum, shift) => sum + shift.waitDuration);
+      Duration.zero,
+      (sum, shift) => sum + shift.waitDuration,
+    );
     final totalDuration = shifts.fold<Duration>(
-        Duration.zero, (sum, shift) => sum + shift.movingDuration);
-    final totalStops =
-        shifts.fold<int>(0, (sum, shift) => sum + shift.stops.length);
+      Duration.zero,
+      (sum, shift) => sum + shift.movingDuration,
+    );
+    final totalStops = shifts.fold<int>(
+      0,
+      (sum, shift) => sum + shift.stops.length,
+    );
     final points = shifts.expand((shift) => shift.points).toList()
       ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
 
@@ -2168,10 +2660,13 @@ class _DayView extends StatelessWidget {
           crossAxisSpacing: 8,
           children: [
             _StatCard(
-                label: 'Day distance',
-                value: '${(totalDistance / 1000).toStringAsFixed(2)} km'),
+              label: 'Day distance',
+              value: '${(totalDistance / 1000).toStringAsFixed(2)} km',
+            ),
             _StatCard(
-                label: 'Day moving', value: formatDuration(totalDuration)),
+              label: 'Day moving',
+              value: formatDuration(totalDuration),
+            ),
             _StatCard(label: 'Day wait', value: formatDuration(totalWait)),
             _StatCard(label: 'Day stops', value: '$totalStops'),
           ],
@@ -2186,8 +2681,10 @@ class _DayView extends StatelessWidget {
               borderRadius: BorderRadius.circular(8),
               border: Border.all(color: Theme.of(context).dividerColor),
             ),
-            child:
-                DayTimelineMap(shifts: shifts, lastKnownPoint: lastKnownPoint),
+            child: DayTimelineMap(
+              shifts: shifts,
+              lastKnownPoint: lastKnownPoint,
+            ),
           ),
         ),
         const SizedBox(height: 12),
@@ -2270,44 +2767,46 @@ class _DayShiftCard extends StatelessWidget {
         leading: const Icon(Icons.route_rounded, color: Color(0xff0f766e)),
         title: Text(DateFormat('HH:mm').format(shift.startedAt)),
         subtitle: Text(
-            '${(shift.distanceMeters / 1000).toStringAsFixed(2)} km - ${formatDuration(shift.movingDuration)} moving - ${shift.stops.length} stops'),
+          '${(shift.distanceMeters / 1000).toStringAsFixed(2)} km - ${formatDuration(shift.movingDuration)} moving - ${shift.stops.length} stops',
+        ),
         trailing: IconButton(
           tooltip: 'Delete shift',
           icon: const Icon(Icons.delete_outline_rounded),
           onPressed: onDelete,
         ),
         children: [
-          ...shift.segments.indexed.map(
-            (entry) {
-              final index = entry.$1 + 1;
-              final segment = entry.$2;
-              return ListTile(
-                leading: const Icon(Icons.local_shipping_rounded),
-                title: Text('Trip $index'),
-                subtitle: Text(
-                    '${segment.reviewed ? 'Reviewed' : 'Needs review'} - ${segment.tripSummary}'),
-                trailing: Wrap(
-                  spacing: 4,
-                  children: [
-                    IconButton(
-                      tooltip: 'Confirm trip',
-                      icon: Icon(segment.reviewed
+          ...shift.segments.indexed.map((entry) {
+            final index = entry.$1 + 1;
+            final segment = entry.$2;
+            return ListTile(
+              leading: const Icon(Icons.local_shipping_rounded),
+              title: Text('Trip $index'),
+              subtitle: Text(
+                '${segment.reviewed ? 'Reviewed' : 'Needs review'} - ${segment.tripSummary}',
+              ),
+              trailing: Wrap(
+                spacing: 4,
+                children: [
+                  IconButton(
+                    tooltip: 'Confirm trip',
+                    icon: Icon(
+                      segment.reviewed
                           ? Icons.verified_rounded
-                          : Icons.check_circle_outline_rounded),
-                      onPressed: segment.reviewed
-                          ? null
-                          : () => onConfirmTrip(segment),
+                          : Icons.check_circle_outline_rounded,
                     ),
-                    IconButton(
-                      tooltip: 'Edit trip',
-                      icon: const Icon(Icons.edit_note_rounded),
-                      onPressed: () => onEditTrip(segment),
-                    ),
-                  ],
-                ),
-              );
-            },
-          ),
+                    onPressed: segment.reviewed
+                        ? null
+                        : () => onConfirmTrip(segment),
+                  ),
+                  IconButton(
+                    tooltip: 'Edit trip',
+                    icon: const Icon(Icons.edit_note_rounded),
+                    onPressed: () => onEditTrip(segment),
+                  ),
+                ],
+              ),
+            );
+          }),
           if (shift.stops.isEmpty)
             const ListTile(title: Text('No stop details yet.'))
           else
@@ -2316,17 +2815,21 @@ class _DayShiftCard extends StatelessWidget {
                 leading: const Icon(Icons.storefront_rounded),
                 title: Text(stop.displayName),
                 subtitle: Text(
-                    '${stop.reviewed ? 'Reviewed' : 'Needs review'} - ${formatDuration(stop.duration)} wait - ${stop.placeLabel}'),
+                  '${stop.reviewed ? 'Reviewed' : 'Needs review'} - ${formatDuration(stop.duration)} wait - ${stop.placeLabel}',
+                ),
                 trailing: Wrap(
                   spacing: 4,
                   children: [
                     IconButton(
                       tooltip: 'Confirm stop',
-                      icon: Icon(stop.reviewed
-                          ? Icons.verified_rounded
-                          : Icons.check_circle_outline_rounded),
-                      onPressed:
-                          stop.reviewed ? null : () => onConfirmStop(stop),
+                      icon: Icon(
+                        stop.reviewed
+                            ? Icons.verified_rounded
+                            : Icons.check_circle_outline_rounded,
+                      ),
+                      onPressed: stop.reviewed
+                          ? null
+                          : () => onConfirmStop(stop),
                     ),
                     IconButton(
                       tooltip: 'Edit stop',
@@ -2359,7 +2862,8 @@ class _HistoryTile extends StatelessWidget {
         leading: const Icon(Icons.history_rounded),
         title: Text(date),
         subtitle: Text(
-            '${(shift.distanceMeters / 1000).toStringAsFixed(2)} km - ${formatDuration(shift.movingDuration)} moving - ${shift.stops.length} stops'),
+          '${(shift.distanceMeters / 1000).toStringAsFixed(2)} km - ${formatDuration(shift.movingDuration)} moving - ${shift.stops.length} stops',
+        ),
         trailing: IconButton(
           tooltip: 'Delete shift',
           icon: const Icon(Icons.delete_outline_rounded),
@@ -2385,26 +2889,190 @@ class _EarningsShiftCard extends StatelessWidget {
         leading: const Icon(Icons.receipt_long_rounded),
         title: Text(DateFormat('HH:mm').format(shift.startedAt)),
         subtitle: Text(
-            '${formatMoney(shift.netEarnings)} net - ${shift.segments.length} trips'),
+          '${formatMoney(shift.netEarnings)} net - ${shift.segments.length} trips',
+        ),
         children: [
-          ...shift.segments.indexed.map(
-            (entry) {
-              final index = entry.$1 + 1;
-              final segment = entry.$2;
-              return ListTile(
-                leading: Icon(segment.platform.icon),
-                title: Text(segment.pickupRestaurantName.isEmpty
+          ...shift.segments.indexed.map((entry) {
+            final index = entry.$1 + 1;
+            final segment = entry.$2;
+            return ListTile(
+              leading: Icon(segment.platform.icon),
+              title: Text(
+                segment.pickupRestaurantName.isEmpty
                     ? 'Trip $index'
-                    : segment.pickupRestaurantName),
-                subtitle: Text(
-                    '${segment.platform.label} - gross ${formatMoney(segment.earnings ?? 0)} - net ${formatMoney(segment.netEarnings)}'),
-                trailing: IconButton(
-                  tooltip: 'Edit trip earnings',
-                  icon: const Icon(Icons.edit_note_rounded),
-                  onPressed: () => onEditTrip(segment),
+                    : segment.pickupRestaurantName,
+              ),
+              subtitle: Text(
+                '${segment.platform.label} - gross ${formatMoney(segment.earnings ?? 0)} - net ${formatMoney(segment.netEarnings)}',
+              ),
+              trailing: IconButton(
+                tooltip: 'Edit trip earnings',
+                icon: const Icon(Icons.edit_note_rounded),
+                onPressed: () => onEditTrip(segment),
+              ),
+            );
+          }),
+        ],
+      ),
+    );
+  }
+}
+
+class RoutePreview extends StatefulWidget {
+  const RoutePreview({
+    super.key,
+    required this.points,
+    required this.lastKnownPoint,
+  });
+
+  final List<TrackPoint> points;
+  final TrackPoint? lastKnownPoint;
+
+  @override
+  State<RoutePreview> createState() => _RoutePreviewState();
+}
+
+class _RoutePreviewState extends State<RoutePreview> {
+  final MapController _controller = MapController();
+  double _zoom = 15;
+
+  @override
+  Widget build(BuildContext context) {
+    final centerPoint = widget.points.isNotEmpty
+        ? widget.points.last
+        : widget.lastKnownPoint;
+    final center = centerPoint == null
+        ? const LatLng(61.4978, 23.7610)
+        : LatLng(centerPoint.latitude, centerPoint.longitude);
+    final route = widget.points
+        .map((point) => LatLng(point.latitude, point.longitude))
+        .toList();
+    _zoom = route.length > 1 ? _zoom : 13;
+
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(8),
+      child: Stack(
+        children: [
+          FlutterMap(
+            mapController: _controller,
+            key: ValueKey(
+              '${center.latitude},${center.longitude},${widget.points.length}',
+            ),
+            options: MapOptions(
+              initialCenter: center,
+              initialZoom: route.length > 1 ? 15 : 13,
+              interactionOptions: const InteractionOptions(
+                flags:
+                    InteractiveFlag.drag |
+                    InteractiveFlag.pinchZoom |
+                    InteractiveFlag.doubleTapZoom,
+              ),
+            ),
+            children: [
+              TileLayer(
+                urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                userAgentPackageName: 'com.mitesh.delivery_route_tracker',
+              ),
+              if (route.length > 1)
+                PolylineLayer(
+                  polylines: [
+                    Polyline(
+                      points: route,
+                      color: const Color(0xff0f766e),
+                      strokeWidth: 5,
+                    ),
+                  ],
                 ),
-              );
-            },
+              MarkerLayer(
+                markers: [
+                  if (route.isNotEmpty)
+                    Marker(
+                      point: route.first,
+                      width: 32,
+                      height: 32,
+                      child: const Icon(
+                        Icons.trip_origin_rounded,
+                        color: Color(0xff16a34a),
+                        size: 28,
+                      ),
+                    ),
+                  if (centerPoint != null)
+                    Marker(
+                      point: center,
+                      width: 40,
+                      height: 40,
+                      child: const Icon(
+                        Icons.my_location_rounded,
+                        color: Color(0xffdc2626),
+                        size: 32,
+                      ),
+                    ),
+                ],
+              ),
+              if (centerPoint == null)
+                const Align(
+                  alignment: Alignment.bottomCenter,
+                  child: Padding(
+                    padding: EdgeInsets.all(10),
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.all(Radius.circular(8)),
+                      ),
+                      child: Padding(
+                        padding: EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 6,
+                        ),
+                        child: Text(
+                          'Start a shift to center the map on your location',
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          Positioned(
+            top: 8,
+            right: 8,
+            child: Column(
+              children: [
+                _MapButton(
+                  icon: Icons.add_rounded,
+                  tooltip: 'Zoom in',
+                  onPressed: () {
+                    _zoom += 1;
+                    _controller.move(center, _zoom);
+                  },
+                ),
+                _MapButton(
+                  icon: Icons.remove_rounded,
+                  tooltip: 'Zoom out',
+                  onPressed: () {
+                    _zoom -= 1;
+                    _controller.move(center, _zoom);
+                  },
+                ),
+                _MapButton(
+                  icon: Icons.my_location_rounded,
+                  tooltip: 'Recenter',
+                  onPressed: () => _controller.move(center, _zoom),
+                ),
+                _MapButton(
+                  icon: Icons.fullscreen_rounded,
+                  tooltip: 'Fullscreen',
+                  onPressed: () => Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => _FullscreenRouteMap(
+                        points: widget.points,
+                        lastKnownPoint: widget.lastKnownPoint,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
           ),
         ],
       ),
@@ -2412,98 +3080,58 @@ class _EarningsShiftCard extends StatelessWidget {
   }
 }
 
-class RoutePreview extends StatelessWidget {
-  const RoutePreview(
-      {super.key, required this.points, required this.lastKnownPoint});
+class _MapButton extends StatelessWidget {
+  const _MapButton({
+    required this.icon,
+    required this.tooltip,
+    required this.onPressed,
+  });
+
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Material(
+        color: Theme.of(context).colorScheme.surface,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+        child: IconButton(
+          tooltip: tooltip,
+          icon: Icon(icon),
+          onPressed: onPressed,
+        ),
+      ),
+    );
+  }
+}
+
+class _FullscreenRouteMap extends StatelessWidget {
+  const _FullscreenRouteMap({
+    required this.points,
+    required this.lastKnownPoint,
+  });
 
   final List<TrackPoint> points;
   final TrackPoint? lastKnownPoint;
 
   @override
   Widget build(BuildContext context) {
-    final centerPoint = points.isNotEmpty ? points.last : lastKnownPoint;
-    final center = centerPoint == null
-        ? const LatLng(61.4978, 23.7610)
-        : LatLng(centerPoint.latitude, centerPoint.longitude);
-    final route =
-        points.map((point) => LatLng(point.latitude, point.longitude)).toList();
-
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(8),
-      child: FlutterMap(
-        key:
-            ValueKey('${center.latitude},${center.longitude},${points.length}'),
-        options: MapOptions(
-          initialCenter: center,
-          initialZoom: points.length > 1 ? 15 : 13,
-          interactionOptions: const InteractionOptions(
-            flags: InteractiveFlag.drag |
-                InteractiveFlag.pinchZoom |
-                InteractiveFlag.doubleTapZoom,
-          ),
-        ),
-        children: [
-          TileLayer(
-            urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-            userAgentPackageName: 'com.mitesh.delivery_route_tracker',
-          ),
-          if (route.length > 1)
-            PolylineLayer(
-              polylines: [
-                Polyline(
-                  points: route,
-                  color: const Color(0xff0f766e),
-                  strokeWidth: 5,
-                ),
-              ],
-            ),
-          MarkerLayer(
-            markers: [
-              if (route.isNotEmpty)
-                Marker(
-                  point: route.first,
-                  width: 32,
-                  height: 32,
-                  child: const Icon(Icons.trip_origin_rounded,
-                      color: Color(0xfff59e0b), size: 26),
-                ),
-              if (centerPoint != null)
-                Marker(
-                  point: center,
-                  width: 40,
-                  height: 40,
-                  child: const Icon(Icons.my_location_rounded,
-                      color: Color(0xffdc2626), size: 32),
-                ),
-            ],
-          ),
-          if (centerPoint == null)
-            const Align(
-              alignment: Alignment.bottomCenter,
-              child: Padding(
-                padding: EdgeInsets.all(10),
-                child: DecoratedBox(
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.all(Radius.circular(8)),
-                  ),
-                  child: Padding(
-                    padding: EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                    child: Text(
-                        'Start a shift to center the map on your location'),
-                  ),
-                ),
-              ),
-            ),
-        ],
-      ),
+    return Scaffold(
+      appBar: AppBar(title: const Text('Trip map')),
+      body: RoutePreview(points: points, lastKnownPoint: lastKnownPoint),
     );
   }
 }
 
 class DayTimelineMap extends StatelessWidget {
-  const DayTimelineMap(
-      {super.key, required this.shifts, required this.lastKnownPoint});
+  const DayTimelineMap({
+    super.key,
+    required this.shifts,
+    required this.lastKnownPoint,
+  });
 
   final List<Shift> shifts;
   final TrackPoint? lastKnownPoint;
@@ -2518,19 +3146,22 @@ class DayTimelineMap extends StatelessWidget {
     final center = centerPoint == null
         ? const LatLng(61.4978, 23.7610)
         : LatLng(centerPoint.latitude, centerPoint.longitude);
-    final route =
-        points.map((point) => LatLng(point.latitude, point.longitude)).toList();
+    final route = points
+        .map((point) => LatLng(point.latitude, point.longitude))
+        .toList();
 
     return ClipRRect(
       borderRadius: BorderRadius.circular(8),
       child: FlutterMap(
         key: ValueKey(
-            'day-${points.length}-${center.latitude}-${center.longitude}'),
+          'day-${points.length}-${center.latitude}-${center.longitude}',
+        ),
         options: MapOptions(
           initialCenter: center,
           initialZoom: route.length > 1 ? 13 : 12,
           interactionOptions: const InteractionOptions(
-            flags: InteractiveFlag.drag |
+            flags:
+                InteractiveFlag.drag |
                 InteractiveFlag.pinchZoom |
                 InteractiveFlag.doubleTapZoom,
           ),
@@ -2557,16 +3188,22 @@ class DayTimelineMap extends StatelessWidget {
                   point: route.first,
                   width: 34,
                   height: 34,
-                  child: const Icon(Icons.flag_circle_rounded,
-                      color: Color(0xfff59e0b), size: 30),
+                  child: const Icon(
+                    Icons.flag_circle_rounded,
+                    color: Color(0xff16a34a),
+                    size: 30,
+                  ),
                 ),
               ...stops.map(
                 (stop) => Marker(
                   point: LatLng(stop.latitude, stop.longitude),
                   width: 34,
                   height: 34,
-                  child: const Icon(Icons.pause_circle_filled_rounded,
-                      color: Color(0xff6366f1), size: 30),
+                  child: Icon(
+                    stop.type.mapIcon,
+                    color: stop.type.mapColor,
+                    size: 30,
+                  ),
                 ),
               ),
               if (route.isNotEmpty)
@@ -2574,8 +3211,11 @@ class DayTimelineMap extends StatelessWidget {
                   point: route.last,
                   width: 38,
                   height: 38,
-                  child: const Icon(Icons.location_on_rounded,
-                      color: Color(0xffdc2626), size: 34),
+                  child: const Icon(
+                    Icons.location_on_rounded,
+                    color: Color(0xffdc2626),
+                    size: 34,
+                  ),
                 ),
             ],
           ),
@@ -2614,22 +3254,26 @@ class _DayTimelineList extends StatelessWidget {
     for (final shift in shifts) {
       for (var i = 0; i < shift.segments.length; i++) {
         final trip = shift.segments[i];
-        entries.add(DayTimelineEntry(
-          at: trip.startedAt,
-          icon: Icons.route_rounded,
-          title: 'Trip ${i + 1}',
-          subtitle:
-              '${(trip.distanceMeters / 1000).toStringAsFixed(2)} km - ${formatDuration(trip.duration)}',
-        ));
+        entries.add(
+          DayTimelineEntry(
+            at: trip.startedAt,
+            icon: Icons.route_rounded,
+            title: 'Trip ${i + 1}',
+            subtitle:
+                '${(trip.distanceMeters / 1000).toStringAsFixed(2)} km - ${formatDuration(trip.duration)}',
+          ),
+        );
       }
       for (final stop in shift.stops) {
-        entries.add(DayTimelineEntry(
-          at: stop.startedAt,
-          icon: stop.type.icon,
-          title: '${stop.type.label}: ${stop.displayName}',
-          subtitle:
-              '${formatDuration(stop.duration)} wait - ${stop.placeLabel}',
-        ));
+        entries.add(
+          DayTimelineEntry(
+            at: stop.startedAt,
+            icon: stop.type.icon,
+            title: '${stop.type.label}: ${stop.displayName}',
+            subtitle:
+                '${formatDuration(stop.duration)} wait - ${stop.placeLabel}',
+          ),
+        );
       }
     }
     entries.sort((a, b) => a.at.compareTo(b.at));
@@ -2649,7 +3293,8 @@ class _DayTimelineList extends StatelessWidget {
                 leading: Icon(entry.icon),
                 title: Text(entry.title),
                 subtitle: Text(
-                    '${DateFormat('HH:mm').format(entry.at)} - ${entry.subtitle}'),
+                  '${DateFormat('HH:mm').format(entry.at)} - ${entry.subtitle}',
+                ),
               ),
             ),
         ],
@@ -2667,10 +3312,15 @@ class Shift {
     List<RouteSegment>? segments,
     List<StopEvent>? stops,
     List<DeliveryLifecycleEvent>? lifecycleEvents,
-  })  : points = points ?? [],
-        segments = segments ?? [],
-        stops = stops ?? [],
-        lifecycleEvents = lifecycleEvents ?? [];
+    List<DeliveryTrip>? deliveryTrips,
+    DateTime? lastActivityAt,
+    this.tripClosureGraceMinutes = 10,
+  }) : points = points ?? [],
+       segments = segments ?? [],
+       stops = stops ?? [],
+       lifecycleEvents = lifecycleEvents ?? [],
+       deliveryTrips = deliveryTrips ?? [],
+       lastActivityAt = lastActivityAt ?? endedAt ?? startedAt;
 
   final String id;
   final DateTime startedAt;
@@ -2679,6 +3329,9 @@ class Shift {
   final List<RouteSegment> segments;
   final List<StopEvent> stops;
   final List<DeliveryLifecycleEvent> lifecycleEvents;
+  final List<DeliveryTrip> deliveryTrips;
+  DateTime lastActivityAt;
+  int tripClosureGraceMinutes;
 
   double get distanceMeters =>
       segments.fold(0, (total, segment) => total + segment.distanceMeters);
@@ -2692,6 +3345,25 @@ class Shift {
       stops.fold(Duration.zero, (total, stop) => total + stop.duration);
   DeliveryLifecycleEvent? get currentStage =>
       lifecycleEvents.isEmpty ? null : lifecycleEvents.last;
+  DeliveryTrip? get activeDeliveryTrip {
+    for (final trip in deliveryTrips.reversed) {
+      if (trip.endedAt == null) return trip;
+    }
+    return null;
+  }
+
+  int get activeOrderCount => activeDeliveryTrip?.activeOrderCount ?? 0;
+
+  DeliveryTrip ensureActiveDeliveryTrip(DateTime now) {
+    final existing = activeDeliveryTrip;
+    if (existing != null) return existing;
+    final trip = DeliveryTrip(
+      id: 'trip-${now.millisecondsSinceEpoch}',
+      startedAt: now,
+    );
+    deliveryTrips.add(trip);
+    return trip;
+  }
 
   Duration durationUntil(DateTime time) => time.difference(startedAt);
 
@@ -2708,120 +3380,319 @@ class Shift {
     var segmentIndex = 1;
     var stopIndex = 1;
     for (final segment in segments) {
-      entries.add(TimelineEntry(
-        isStop: false,
-        title: 'Route $segmentIndex',
-        subtitle:
-            '${(segment.distanceMeters / 1000).toStringAsFixed(2)} km - ${formatDuration(segment.duration)} moving',
-        at: segment.startedAt,
-      ));
+      entries.add(
+        TimelineEntry(
+          isStop: false,
+          title: 'Route $segmentIndex',
+          subtitle:
+              '${(segment.distanceMeters / 1000).toStringAsFixed(2)} km - ${formatDuration(segment.duration)} moving',
+          at: segment.startedAt,
+        ),
+      );
       segmentIndex++;
     }
     for (final stop in stops) {
-      entries.add(TimelineEntry(
-        isStop: true,
-        title: stop.displayName == 'Unlabeled stop'
-            ? 'Stop $stopIndex'
-            : stop.displayName,
-        subtitle: '${formatDuration(stop.duration)} wait - ${stop.placeLabel}',
-        at: stop.startedAt,
-        stop: stop,
-      ));
+      entries.add(
+        TimelineEntry(
+          isStop: true,
+          title: stop.displayName == 'Unlabeled stop'
+              ? 'Stop $stopIndex'
+              : stop.displayName,
+          subtitle:
+              '${formatDuration(stop.duration)} wait - ${stop.placeLabel}',
+          at: stop.startedAt,
+          stop: stop,
+        ),
+      );
       stopIndex++;
     }
     for (final event in lifecycleEvents) {
-      entries.add(TimelineEntry(
-        isStop: false,
-        title: event.stage.label,
-        subtitle: 'Delivery status updated',
-        at: event.timestamp,
-      ));
+      entries.add(
+        TimelineEntry(
+          isStop: false,
+          title: event.stage.label,
+          subtitle: 'Delivery status updated',
+          at: event.timestamp,
+        ),
+      );
     }
     entries.sort((a, b) => a.at.compareTo(b.at));
     return entries;
   }
 
   Map<String, dynamic> toJson() => {
-        'id': id,
-        'startedAt': startedAt.toIso8601String(),
-        'endedAt': endedAt?.toIso8601String(),
-        'points': points.map((p) => p.toJson()).toList(),
-        'segments': segments.map((s) => s.toJson()).toList(),
-        'stops': stops.map((s) => s.toJson()).toList(),
-        'lifecycleEvents': lifecycleEvents.map((e) => e.toJson()).toList(),
-      };
+    'id': id,
+    'startedAt': startedAt.toIso8601String(),
+    'endedAt': endedAt?.toIso8601String(),
+    'points': points.map((p) => p.toJson()).toList(),
+    'segments': segments.map((s) => s.toJson()).toList(),
+    'stops': stops.map((s) => s.toJson()).toList(),
+    'lifecycleEvents': lifecycleEvents.map((e) => e.toJson()).toList(),
+    'deliveryTrips': deliveryTrips.map((t) => t.toJson()).toList(),
+    'lastActivityAt': lastActivityAt.toIso8601String(),
+    'tripClosureGraceMinutes': tripClosureGraceMinutes,
+  };
 
   static Shift fromJson(Map<String, dynamic> json) => Shift(
-        id: json['id'] as String,
-        startedAt: DateTime.parse(json['startedAt'] as String),
-        endedAt: json['endedAt'] == null
-            ? null
-            : DateTime.parse(json['endedAt'] as String),
-        points: (json['points'] as List? ?? [])
-            .map((p) => TrackPoint.fromJson(p as Map<String, dynamic>))
-            .toList(),
-        segments: (json['segments'] as List? ?? [])
-            .map((s) => RouteSegment.fromJson(s as Map<String, dynamic>))
-            .toList(),
-        stops: (json['stops'] as List? ?? [])
-            .map((s) => StopEvent.fromJson(s as Map<String, dynamic>))
-            .toList(),
-        lifecycleEvents: (json['lifecycleEvents'] as List? ?? [])
-            .map((e) =>
-                DeliveryLifecycleEvent.fromJson(e as Map<String, dynamic>))
-            .toList(),
+    id: json['id'] as String,
+    startedAt: DateTime.parse(json['startedAt'] as String),
+    endedAt: json['endedAt'] == null
+        ? null
+        : DateTime.parse(json['endedAt'] as String),
+    points: (json['points'] as List? ?? [])
+        .map((p) => TrackPoint.fromJson(p as Map<String, dynamic>))
+        .toList(),
+    segments: (json['segments'] as List? ?? [])
+        .map((s) => RouteSegment.fromJson(s as Map<String, dynamic>))
+        .toList(),
+    stops: (json['stops'] as List? ?? [])
+        .map((s) => StopEvent.fromJson(s as Map<String, dynamic>))
+        .toList(),
+    lifecycleEvents: (json['lifecycleEvents'] as List? ?? [])
+        .map((e) => DeliveryLifecycleEvent.fromJson(e as Map<String, dynamic>))
+        .toList(),
+    deliveryTrips: (json['deliveryTrips'] as List? ?? [])
+        .map((t) => DeliveryTrip.fromJson(t as Map<String, dynamic>))
+        .toList(),
+    lastActivityAt: json['lastActivityAt'] == null
+        ? null
+        : DateTime.parse(json['lastActivityAt'] as String),
+    tripClosureGraceMinutes:
+        (json['tripClosureGraceMinutes'] as num?)?.toInt() ?? 10,
+  );
+}
+
+class DeliveryTrip {
+  DeliveryTrip({
+    required this.id,
+    required this.startedAt,
+    this.endedAt,
+    this.eligibleForClosureAt,
+    List<DeliveryOrder>? orders,
+  }) : orders = orders ?? [];
+
+  final String id;
+  final DateTime startedAt;
+  DateTime? endedAt;
+  DateTime? eligibleForClosureAt;
+  final List<DeliveryOrder> orders;
+
+  int get activeOrderCount => orders
+      .where(
+        (order) =>
+            order.pickedUpAt != null &&
+            order.deliveredAt == null &&
+            order.cancelledAt == null,
+      )
+      .length;
+  bool get allOrdersDelivered =>
+      orders.isNotEmpty &&
+      orders.every(
+        (order) =>
+            order.status == DeliveryOrderStatus.delivered ||
+            order.status == DeliveryOrderStatus.cancelled,
       );
+  DeliveryOrder? get latestOpenOrder {
+    for (final order in orders.reversed) {
+      if (order.status != DeliveryOrderStatus.delivered &&
+          order.status != DeliveryOrderStatus.cancelled) {
+        return order;
+      }
+    }
+    return null;
+  }
+
+  DeliveryOrder? get latestUndeliveredOrder {
+    for (final order in orders.reversed) {
+      if (order.status == DeliveryOrderStatus.pickedUp ||
+          order.status == DeliveryOrderStatus.accepted) {
+        return order;
+      }
+    }
+    return null;
+  }
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'startedAt': startedAt.toIso8601String(),
+    'endedAt': endedAt?.toIso8601String(),
+    'eligibleForClosureAt': eligibleForClosureAt?.toIso8601String(),
+    'orders': orders.map((order) => order.toJson()).toList(),
+  };
+
+  static DeliveryTrip fromJson(Map<String, dynamic> json) => DeliveryTrip(
+    id: json['id'] as String,
+    startedAt: DateTime.parse(json['startedAt'] as String),
+    endedAt: json['endedAt'] == null
+        ? null
+        : DateTime.parse(json['endedAt'] as String),
+    eligibleForClosureAt: json['eligibleForClosureAt'] == null
+        ? null
+        : DateTime.parse(json['eligibleForClosureAt'] as String),
+    orders: (json['orders'] as List? ?? [])
+        .map((o) => DeliveryOrder.fromJson(o as Map<String, dynamic>))
+        .toList(),
+  );
+}
+
+class DeliveryOrder {
+  DeliveryOrder({
+    required this.id,
+    required this.acceptedAt,
+    this.status = DeliveryOrderStatus.accepted,
+    this.pickedUpAt,
+    this.deliveredAt,
+    this.cancelledAt,
+  });
+
+  final String id;
+  final DateTime acceptedAt;
+  DeliveryOrderStatus status;
+  DateTime? pickedUpAt;
+  DateTime? deliveredAt;
+  DateTime? cancelledAt;
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'acceptedAt': acceptedAt.toIso8601String(),
+    'status': status.name,
+    'pickedUpAt': pickedUpAt?.toIso8601String(),
+    'deliveredAt': deliveredAt?.toIso8601String(),
+    'cancelledAt': cancelledAt?.toIso8601String(),
+  };
+
+  static DeliveryOrder fromJson(Map<String, dynamic> json) => DeliveryOrder(
+    id: json['id'] as String,
+    acceptedAt: DateTime.parse(json['acceptedAt'] as String),
+    status:
+        DeliveryOrderStatusX.fromName(json['status'] as String?) ??
+        DeliveryOrderStatus.accepted,
+    pickedUpAt: json['pickedUpAt'] == null
+        ? null
+        : DateTime.parse(json['pickedUpAt'] as String),
+    deliveredAt: json['deliveredAt'] == null
+        ? null
+        : DateTime.parse(json['deliveredAt'] as String),
+    cancelledAt: json['cancelledAt'] == null
+        ? null
+        : DateTime.parse(json['cancelledAt'] as String),
+  );
+}
+
+enum DeliveryOrderStatus { accepted, pickedUp, delivered, cancelled }
+
+extension DeliveryOrderStatusX on DeliveryOrderStatus {
+  String get label => switch (this) {
+    DeliveryOrderStatus.accepted => 'Accepted',
+    DeliveryOrderStatus.pickedUp => 'Picked up',
+    DeliveryOrderStatus.delivered => 'Delivered',
+    DeliveryOrderStatus.cancelled => 'Cancelled',
+  };
+
+  static DeliveryOrderStatus? fromName(String? name) {
+    if (name == null) return null;
+    for (final status in DeliveryOrderStatus.values) {
+      if (status.name == name) return status;
+    }
+    return null;
+  }
 }
 
 class DeliveryLifecycleEvent {
-  DeliveryLifecycleEvent({
-    required this.stage,
-    required this.timestamp,
-  });
+  DeliveryLifecycleEvent({required this.stage, required this.timestamp});
 
   final DeliveryLifecycleStage stage;
   final DateTime timestamp;
 
   Map<String, dynamic> toJson() => {
-        'stage': stage.name,
-        'timestamp': timestamp.toIso8601String(),
-      };
+    'stage': stage.name,
+    'timestamp': timestamp.toIso8601String(),
+  };
 
   static DeliveryLifecycleEvent fromJson(Map<String, dynamic> json) =>
       DeliveryLifecycleEvent(
-        stage: DeliveryLifecycleStageX.fromName(json['stage'] as String?) ??
-            DeliveryLifecycleStage.accepted,
+        stage:
+            DeliveryLifecycleStageX.fromName(json['stage'] as String?) ??
+            DeliveryLifecycleStage.waitingForOrder,
         timestamp: DateTime.parse(json['timestamp'] as String),
       );
 }
 
-enum DeliveryLifecycleStage { accepted, atRestaurant, pickedUp, delivered }
+enum DeliveryLifecycleStage {
+  shiftStarted,
+  shiftPaused,
+  shiftEnded,
+  waitingForOrder,
+  orderAccepted,
+  travelingToRestaurant,
+  atRestaurant,
+  orderPickedUp,
+  travelingToCustomer,
+  delivered,
+  multipleOrdersActive,
+  delayedAtRestaurant,
+  customerUnavailable,
+  orderCancelled,
+}
 
 extension DeliveryLifecycleStageX on DeliveryLifecycleStage {
   String get label => switch (this) {
-        DeliveryLifecycleStage.accepted => 'Accepted',
-        DeliveryLifecycleStage.atRestaurant => 'At restaurant',
-        DeliveryLifecycleStage.pickedUp => 'Picked up',
-        DeliveryLifecycleStage.delivered => 'Delivered',
-      };
+    DeliveryLifecycleStage.shiftStarted => 'Shift started',
+    DeliveryLifecycleStage.shiftPaused => 'Shift paused',
+    DeliveryLifecycleStage.shiftEnded => 'Shift ended',
+    DeliveryLifecycleStage.waitingForOrder => 'Waiting for order',
+    DeliveryLifecycleStage.orderAccepted => 'Order accepted',
+    DeliveryLifecycleStage.travelingToRestaurant => 'Traveling to restaurant',
+    DeliveryLifecycleStage.atRestaurant => 'At restaurant',
+    DeliveryLifecycleStage.orderPickedUp => 'Order picked up',
+    DeliveryLifecycleStage.travelingToCustomer => 'Traveling to customer',
+    DeliveryLifecycleStage.delivered => 'Delivered',
+    DeliveryLifecycleStage.multipleOrdersActive => 'Multiple orders',
+    DeliveryLifecycleStage.delayedAtRestaurant => 'Delayed at restaurant',
+    DeliveryLifecycleStage.customerUnavailable => 'Customer unavailable',
+    DeliveryLifecycleStage.orderCancelled => 'Order cancelled',
+  };
 
   String get statusText => switch (this) {
-        DeliveryLifecycleStage.accepted => 'Order accepted',
-        DeliveryLifecycleStage.atRestaurant =>
-          'At restaurant - waiting for pickup',
-        DeliveryLifecycleStage.pickedUp => 'Picked up - heading to customer',
-        DeliveryLifecycleStage.delivered => 'Delivered',
-      };
+    DeliveryLifecycleStage.shiftStarted => 'Shift started',
+    DeliveryLifecycleStage.shiftPaused => 'Shift paused',
+    DeliveryLifecycleStage.shiftEnded => 'Shift ended',
+    DeliveryLifecycleStage.waitingForOrder => 'Waiting for order',
+    DeliveryLifecycleStage.orderAccepted => 'Order accepted',
+    DeliveryLifecycleStage.travelingToRestaurant => 'Traveling to restaurant',
+    DeliveryLifecycleStage.atRestaurant => 'At restaurant - waiting for pickup',
+    DeliveryLifecycleStage.orderPickedUp => 'Picked up - heading to customer',
+    DeliveryLifecycleStage.travelingToCustomer => 'Traveling to customer',
+    DeliveryLifecycleStage.delivered => 'Delivered',
+    DeliveryLifecycleStage.multipleOrdersActive => 'Multiple orders active',
+    DeliveryLifecycleStage.delayedAtRestaurant => 'Delayed at restaurant',
+    DeliveryLifecycleStage.customerUnavailable => 'Customer unavailable',
+    DeliveryLifecycleStage.orderCancelled => 'Order cancelled',
+  };
 
   IconData get icon => switch (this) {
-        DeliveryLifecycleStage.accepted => Icons.check_circle_outline_rounded,
-        DeliveryLifecycleStage.atRestaurant => Icons.restaurant_rounded,
-        DeliveryLifecycleStage.pickedUp => Icons.shopping_bag_rounded,
-        DeliveryLifecycleStage.delivered => Icons.task_alt_rounded,
-      };
+    DeliveryLifecycleStage.shiftStarted => Icons.play_arrow_rounded,
+    DeliveryLifecycleStage.shiftPaused => Icons.pause_rounded,
+    DeliveryLifecycleStage.shiftEnded => Icons.stop_rounded,
+    DeliveryLifecycleStage.waitingForOrder => Icons.hourglass_bottom_rounded,
+    DeliveryLifecycleStage.orderAccepted => Icons.check_circle_outline_rounded,
+    DeliveryLifecycleStage.travelingToRestaurant =>
+      Icons.directions_bike_rounded,
+    DeliveryLifecycleStage.atRestaurant => Icons.restaurant_rounded,
+    DeliveryLifecycleStage.orderPickedUp => Icons.shopping_bag_rounded,
+    DeliveryLifecycleStage.travelingToCustomer => Icons.delivery_dining_rounded,
+    DeliveryLifecycleStage.delivered => Icons.task_alt_rounded,
+    DeliveryLifecycleStage.multipleOrdersActive =>
+      Icons.library_add_check_rounded,
+    DeliveryLifecycleStage.delayedAtRestaurant => Icons.schedule_rounded,
+    DeliveryLifecycleStage.customerUnavailable => Icons.person_off_rounded,
+    DeliveryLifecycleStage.orderCancelled => Icons.cancel_rounded,
+  };
 
   static DeliveryLifecycleStage? fromName(String? name) {
     if (name == null) return null;
+    if (name == 'accepted') return DeliveryLifecycleStage.orderAccepted;
+    if (name == 'pickedUp') return DeliveryLifecycleStage.orderPickedUp;
     for (final stage in DeliveryLifecycleStage.values) {
       if (stage.name == name) return stage;
     }
@@ -2852,8 +3723,9 @@ class RouteSegment {
   double get netEarnings => (earnings ?? 0) * (1 - platform.deductionRate);
 
   String get tripSummary {
-    final restaurant =
-        pickupRestaurantName.isEmpty ? 'No restaurant' : pickupRestaurantName;
+    final restaurant = pickupRestaurantName.isEmpty
+        ? 'No restaurant'
+        : pickupRestaurantName;
     return '$restaurant - ${platform.label} - ${formatMoney(earnings ?? 0)} gross';
   }
 
@@ -2866,47 +3738,47 @@ class RouteSegment {
   }
 
   Map<String, dynamic> toJson() => {
-        'startedAt': startedAt.toIso8601String(),
-        'endedAt': endedAt?.toIso8601String(),
-        'pickupRestaurantName': pickupRestaurantName,
-        'platform': platform.name,
-        'earnings': earnings,
-        'reviewed': reviewed,
-        'points': points.map((p) => p.toJson()).toList(),
-      };
+    'startedAt': startedAt.toIso8601String(),
+    'endedAt': endedAt?.toIso8601String(),
+    'pickupRestaurantName': pickupRestaurantName,
+    'platform': platform.name,
+    'earnings': earnings,
+    'reviewed': reviewed,
+    'points': points.map((p) => p.toJson()).toList(),
+  };
 
   static RouteSegment fromJson(Map<String, dynamic> json) => RouteSegment(
-        startedAt: DateTime.parse(json['startedAt'] as String),
-        endedAt: json['endedAt'] == null
-            ? null
-            : DateTime.parse(json['endedAt'] as String),
-        pickupRestaurantName: json['pickupRestaurantName'] as String? ?? '',
-        platform: DeliveryPlatformX.fromName(json['platform'] as String?),
-        earnings: (json['earnings'] as num?)?.toDouble(),
-        reviewed: json['reviewed'] as bool? ?? false,
-        points: (json['points'] as List? ?? [])
-            .map((p) => TrackPoint.fromJson(p as Map<String, dynamic>))
-            .toList(),
-      );
+    startedAt: DateTime.parse(json['startedAt'] as String),
+    endedAt: json['endedAt'] == null
+        ? null
+        : DateTime.parse(json['endedAt'] as String),
+    pickupRestaurantName: json['pickupRestaurantName'] as String? ?? '',
+    platform: DeliveryPlatformX.fromName(json['platform'] as String?),
+    earnings: (json['earnings'] as num?)?.toDouble(),
+    reviewed: json['reviewed'] as bool? ?? false,
+    points: (json['points'] as List? ?? [])
+        .map((p) => TrackPoint.fromJson(p as Map<String, dynamic>))
+        .toList(),
+  );
 }
 
 enum DeliveryPlatform { wolt, uberEats }
 
 extension DeliveryPlatformX on DeliveryPlatform {
   String get label => switch (this) {
-        DeliveryPlatform.wolt => 'Wolt',
-        DeliveryPlatform.uberEats => 'Uber Eats',
-      };
+    DeliveryPlatform.wolt => 'Wolt',
+    DeliveryPlatform.uberEats => 'Uber Eats',
+  };
 
   double get deductionRate => switch (this) {
-        DeliveryPlatform.wolt => 0,
-        DeliveryPlatform.uberEats => 0.255,
-      };
+    DeliveryPlatform.wolt => 0,
+    DeliveryPlatform.uberEats => 0.255,
+  };
 
   IconData get icon => switch (this) {
-        DeliveryPlatform.wolt => Icons.delivery_dining_rounded,
-        DeliveryPlatform.uberEats => Icons.two_wheeler_rounded,
-      };
+    DeliveryPlatform.wolt => Icons.delivery_dining_rounded,
+    DeliveryPlatform.uberEats => Icons.two_wheeler_rounded,
+  };
 
   static DeliveryPlatform fromName(String? name) {
     return DeliveryPlatform.values.firstWhere(
@@ -2953,48 +3825,64 @@ class StopEvent {
   }
 
   Map<String, dynamic> toJson() => {
-        'latitude': latitude,
-        'longitude': longitude,
-        'startedAt': startedAt.toIso8601String(),
-        'endedAt': endedAt.toIso8601String(),
-        'restaurantName': restaurantName,
-        'placeName': placeName,
-        'note': note,
-        'type': type.name,
-        'reviewed': reviewed,
-      };
+    'latitude': latitude,
+    'longitude': longitude,
+    'startedAt': startedAt.toIso8601String(),
+    'endedAt': endedAt.toIso8601String(),
+    'restaurantName': restaurantName,
+    'placeName': placeName,
+    'note': note,
+    'type': type.name,
+    'reviewed': reviewed,
+  };
 
   static StopEvent fromJson(Map<String, dynamic> json) => StopEvent(
-        latitude: (json['latitude'] as num).toDouble(),
-        longitude: (json['longitude'] as num).toDouble(),
-        startedAt: DateTime.parse(json['startedAt'] as String),
-        endedAt: DateTime.parse(json['endedAt'] as String),
-        restaurantName: json['restaurantName'] as String? ?? '',
-        placeName: json['placeName'] as String? ?? '',
-        note: json['note'] as String? ?? '',
-        type: StopTypeX.fromName(json['type'] as String?) ?? StopType.other,
-        reviewed: json['reviewed'] as bool? ?? false,
-      );
+    latitude: (json['latitude'] as num).toDouble(),
+    longitude: (json['longitude'] as num).toDouble(),
+    startedAt: DateTime.parse(json['startedAt'] as String),
+    endedAt: DateTime.parse(json['endedAt'] as String),
+    restaurantName: json['restaurantName'] as String? ?? '',
+    placeName: json['placeName'] as String? ?? '',
+    note: json['note'] as String? ?? '',
+    type: StopTypeX.fromName(json['type'] as String?) ?? StopType.other,
+    reviewed: json['reviewed'] as bool? ?? false,
+  );
 }
 
 enum StopType { restaurant, customer, breakTime, waitingForOrder, other }
 
 extension StopTypeX on StopType {
   String get label => switch (this) {
-        StopType.restaurant => 'Restaurant',
-        StopType.customer => 'Customer',
-        StopType.breakTime => 'Break',
-        StopType.waitingForOrder => 'Waiting for order',
-        StopType.other => 'Other',
-      };
+    StopType.restaurant => 'Restaurant',
+    StopType.customer => 'Customer',
+    StopType.breakTime => 'Break',
+    StopType.waitingForOrder => 'Waiting for order',
+    StopType.other => 'Other',
+  };
 
   IconData get icon => switch (this) {
-        StopType.restaurant => Icons.restaurant_rounded,
-        StopType.customer => Icons.person_pin_circle_rounded,
-        StopType.breakTime => Icons.free_breakfast_rounded,
-        StopType.waitingForOrder => Icons.hourglass_bottom_rounded,
-        StopType.other => Icons.more_horiz_rounded,
-      };
+    StopType.restaurant => Icons.restaurant_rounded,
+    StopType.customer => Icons.person_pin_circle_rounded,
+    StopType.breakTime => Icons.free_breakfast_rounded,
+    StopType.waitingForOrder => Icons.hourglass_bottom_rounded,
+    StopType.other => Icons.more_horiz_rounded,
+  };
+
+  IconData get mapIcon => switch (this) {
+    StopType.restaurant => Icons.restaurant_rounded,
+    StopType.customer => Icons.location_on_rounded,
+    StopType.breakTime => Icons.pause_circle_filled_rounded,
+    StopType.waitingForOrder => Icons.hourglass_bottom_rounded,
+    StopType.other => Icons.pause_circle_filled_rounded,
+  };
+
+  Color get mapColor => switch (this) {
+    StopType.restaurant => const Color(0xff2563eb),
+    StopType.customer => const Color(0xff7c3aed),
+    StopType.breakTime => const Color(0xfff59e0b),
+    StopType.waitingForOrder => const Color(0xffeab308),
+    StopType.other => const Color(0xff6366f1),
+  };
 
   static StopType? fromName(String? name) {
     if (name == null) return null;
@@ -3021,20 +3909,20 @@ class TrackPoint {
   final double speedMetersPerSecond;
 
   Map<String, dynamic> toJson() => {
-        'latitude': latitude,
-        'longitude': longitude,
-        'timestamp': timestamp.toIso8601String(),
-        'accuracy': accuracy,
-        'speedMetersPerSecond': speedMetersPerSecond,
-      };
+    'latitude': latitude,
+    'longitude': longitude,
+    'timestamp': timestamp.toIso8601String(),
+    'accuracy': accuracy,
+    'speedMetersPerSecond': speedMetersPerSecond,
+  };
 
   static TrackPoint fromJson(Map<String, dynamic> json) => TrackPoint(
-        latitude: (json['latitude'] as num).toDouble(),
-        longitude: (json['longitude'] as num).toDouble(),
-        timestamp: DateTime.parse(json['timestamp'] as String),
-        accuracy: (json['accuracy'] as num).toDouble(),
-        speedMetersPerSecond: (json['speedMetersPerSecond'] as num).toDouble(),
-      );
+    latitude: (json['latitude'] as num).toDouble(),
+    longitude: (json['longitude'] as num).toDouble(),
+    timestamp: DateTime.parse(json['timestamp'] as String),
+    accuracy: (json['accuracy'] as num).toDouble(),
+    speedMetersPerSecond: (json['speedMetersPerSecond'] as num).toDouble(),
+  );
 }
 
 class StopDraft {
@@ -3134,7 +4022,9 @@ class ShiftStore {
     shifts.removeWhere((item) => item.id == shift.id);
     shifts.insert(0, shift);
     await prefs.setString(
-        _key, jsonEncode(shifts.map((item) => item.toJson()).toList()));
+      _key,
+      jsonEncode(shifts.map((item) => item.toJson()).toList()),
+    );
   }
 
   Future<void> deleteShift(String id) async {
@@ -3142,14 +4032,18 @@ class ShiftStore {
     final shifts = await load();
     shifts.removeWhere((item) => item.id == id);
     await prefs.setString(
-        _key, jsonEncode(shifts.map((item) => item.toJson()).toList()));
+      _key,
+      jsonEncode(shifts.map((item) => item.toJson()).toList()),
+    );
   }
 
   Future<void> replaceAll(List<Shift> shifts) async {
     final prefs = await SharedPreferences.getInstance();
     shifts.sort((a, b) => b.startedAt.compareTo(a.startedAt));
     await prefs.setString(
-        _key, jsonEncode(shifts.map((item) => item.toJson()).toList()));
+      _key,
+      jsonEncode(shifts.map((item) => item.toJson()).toList()),
+    );
   }
 }
 
@@ -3159,7 +4053,8 @@ double haversineMeters(TrackPoint a, TrackPoint b) {
   final lat2 = b.latitude * pi / 180;
   final dLat = (b.latitude - a.latitude) * pi / 180;
   final dLng = (b.longitude - a.longitude) * pi / 180;
-  final h = sin(dLat / 2) * sin(dLat / 2) +
+  final h =
+      sin(dLat / 2) * sin(dLat / 2) +
       cos(lat1) * cos(lat2) * sin(dLng / 2) * sin(dLng / 2);
   return earthRadius * 2 * atan2(sqrt(h), sqrt(1 - h));
 }
@@ -3332,23 +4227,28 @@ String shiftsToGpx(List<Shift> shifts) {
   final buffer = StringBuffer()
     ..writeln('<?xml version="1.0" encoding="UTF-8"?>')
     ..writeln(
-        '<gpx version="1.1" creator="Delivery Tracker" xmlns="http://www.topografix.com/GPX/1/1">');
+      '<gpx version="1.1" creator="Delivery Tracker" xmlns="http://www.topografix.com/GPX/1/1">',
+    );
   for (final shift in shifts) {
     buffer
       ..writeln('  <trk>')
       ..writeln(
-          '    <name>Shift ${escapeXml(DateFormat('yyyy-MM-dd HH:mm').format(shift.startedAt))}</name>')
+        '    <name>Shift ${escapeXml(DateFormat('yyyy-MM-dd HH:mm').format(shift.startedAt))}</name>',
+      )
       ..writeln('    <trkseg>');
     final points = [...shift.points]
       ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
     for (final point in points) {
       buffer
         ..writeln(
-            '      <trkpt lat="${point.latitude.toStringAsFixed(7)}" lon="${point.longitude.toStringAsFixed(7)}">')
+          '      <trkpt lat="${point.latitude.toStringAsFixed(7)}" lon="${point.longitude.toStringAsFixed(7)}">',
+        )
         ..writeln(
-            '        <time>${point.timestamp.toUtc().toIso8601String()}</time>')
+          '        <time>${point.timestamp.toUtc().toIso8601String()}</time>',
+        )
         ..writeln(
-            '        <extensions><accuracy>${point.accuracy.toStringAsFixed(1)}</accuracy><speed>${point.speedMetersPerSecond.toStringAsFixed(2)}</speed></extensions>')
+          '        <extensions><accuracy>${point.accuracy.toStringAsFixed(1)}</accuracy><speed>${point.speedMetersPerSecond.toStringAsFixed(2)}</speed></extensions>',
+        )
         ..writeln('      </trkpt>');
     }
     buffer
@@ -3357,10 +4257,12 @@ String shiftsToGpx(List<Shift> shifts) {
     for (final stop in shift.stops) {
       buffer
         ..writeln(
-            '  <wpt lat="${stop.latitude.toStringAsFixed(7)}" lon="${stop.longitude.toStringAsFixed(7)}">')
+          '  <wpt lat="${stop.latitude.toStringAsFixed(7)}" lon="${stop.longitude.toStringAsFixed(7)}">',
+        )
         ..writeln('    <name>${escapeXml(stop.type.label)} stop</name>')
         ..writeln(
-            '    <desc>${escapeXml(stop.displayName)} - ${escapeXml(formatDuration(stop.duration))}</desc>')
+          '    <desc>${escapeXml(stop.displayName)} - ${escapeXml(formatDuration(stop.duration))}</desc>',
+        )
         ..writeln('  </wpt>');
     }
   }
@@ -3381,13 +4283,15 @@ String shiftsToKml(List<Shift> shifts) {
       buffer
         ..writeln('    <Placemark>')
         ..writeln(
-            '      <name>Shift ${escapeXml(DateFormat('yyyy-MM-dd HH:mm').format(shift.startedAt))}</name>')
+          '      <name>Shift ${escapeXml(DateFormat('yyyy-MM-dd HH:mm').format(shift.startedAt))}</name>',
+        )
         ..writeln('      <LineString>')
         ..writeln('        <tessellate>1</tessellate>')
         ..writeln('        <coordinates>');
       for (final point in points) {
         buffer.writeln(
-            '          ${point.longitude.toStringAsFixed(7)},${point.latitude.toStringAsFixed(7)},0');
+          '          ${point.longitude.toStringAsFixed(7)},${point.latitude.toStringAsFixed(7)},0',
+        );
       }
       buffer
         ..writeln('        </coordinates>')
@@ -3399,9 +4303,11 @@ String shiftsToKml(List<Shift> shifts) {
         ..writeln('    <Placemark>')
         ..writeln('      <name>${escapeXml(stop.type.label)} stop</name>')
         ..writeln(
-            '      <description>${escapeXml(stop.displayName)} - ${escapeXml(formatDuration(stop.duration))}</description>')
+          '      <description>${escapeXml(stop.displayName)} - ${escapeXml(formatDuration(stop.duration))}</description>',
+        )
         ..writeln(
-            '      <Point><coordinates>${stop.longitude.toStringAsFixed(7)},${stop.latitude.toStringAsFixed(7)},0</coordinates></Point>')
+          '      <Point><coordinates>${stop.longitude.toStringAsFixed(7)},${stop.latitude.toStringAsFixed(7)},0</coordinates></Point>',
+        )
         ..writeln('    </Placemark>');
     }
   }

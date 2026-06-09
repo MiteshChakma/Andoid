@@ -62,14 +62,16 @@ flowchart LR
 
 - Android foreground tracking so movement can continue while the app is backgrounded or the screen is locked.
 - Active shift autosave every 30 seconds to reduce data loss if Android kills the app.
+- Active shift recovery with configurable grace period after accidental closure.
 - GPS route recording with point-by-point route history.
 - Route quality cleanup for weak GPS accuracy, impossible jumps, and unrealistic speed spikes.
 - Automatic trip and stop detection.
 - Stop/wait zone radius: **300 meters**.
 - Stop detection delay: **60 seconds**.
 - Battery-safe mode that lowers GPS frequency while stopped and uses higher accuracy while moving.
-- Delivery lifecycle buttons: **Accepted**, **At restaurant**, **Picked up**, **Delivered**.
+- Expanded delivery lifecycle: **Shift started**, **Waiting for order**, **Order accepted**, **Traveling to restaurant**, **At restaurant**, **Order picked up**, **Traveling to customer**, **Delivered**, plus optional exception states.
 - Lifecycle controls in app and notification actions.
+- Order/trip data model for stacked and multi-order deliveries.
 - Auto stop classification: **Restaurant**, **Customer**, **Break**, **Waiting for order**, **Other**.
 - Stop classification in app and notification actions.
 - Editable restaurant/pickup name for each trip.
@@ -82,6 +84,7 @@ flowchart LR
 - Route verification: confirm detected trips and stops after review.
 - Daily performance analytics.
 - Local diagnostics panel for GPS errors, permissions, notification status, and tracking service state.
+- Map controls for zoom, recenter, and fullscreen active route inspection.
 - Local-only storage with CSV, JSON, GPX, and KML export options.
 - Dark mode for battery-friendly delivery sessions.
 
@@ -99,6 +102,7 @@ These are feature milestones for this prototype. The package version in `pubspec
 | v0.6 | Timeline | Full-day GPS point storage, map timeline view, route path display, stop markers. |
 | v0.7 | Delivery workflow | Lifecycle buttons, notification actions, stop classification prompts, JSON backup/restore. |
 | v0.8 | Production hardening | GPS quality filtering, active shift autosave, route verification, timeline playback, performance analytics, diagnostics, GPX/KML exports. |
+| v0.9 | Shift continuity and multi-order model | Accidental-close recovery, configurable recovery grace period, expanded lifecycle statuses, order/trip data model, stacked delivery support, active order count, trip closure rules, improved map markers and controls. |
 
 ## Working Process
 
@@ -109,15 +113,20 @@ These are feature milestones for this prototype. The package version in `pubspec
 5. When movement stays inside the 300 m wait zone for more than 60 seconds, the app creates a stop.
 6. Classify the stop as restaurant, customer, break, waiting for order, or other.
 7. Use lifecycle buttons during delivery:
-   - Accepted
+   - Waiting for order
+   - Order accepted
+   - Traveling to restaurant
    - At restaurant
-   - Picked up
+   - Order picked up
+   - Traveling to customer
    - Delivered
-8. Stop the shift when finished.
-9. Review detected trips and stops in Calendar.
-10. Add restaurant names, platform, and earnings.
-11. Check daily earnings and performance analytics.
-12. Export data as CSV, JSON, GPX, or KML.
+8. Add extra accepted orders during an active trip for stacked deliveries.
+9. A trip is eligible to close only after all active orders are delivered and the driver returns to waiting mode for the configured grace period.
+10. Stop the shift only when finished.
+11. Review detected trips and stops in Calendar.
+12. Add restaurant names, platform, and earnings.
+13. Check daily earnings and performance analytics.
+14. Export data as CSV, JSON, GPX, or KML.
 
 ## Analytics
 
@@ -222,6 +231,7 @@ Recommended future privacy improvements:
 - OpenStreetMap tiles require internet access.
 - Data is local but not encrypted yet.
 - Notification action handling is implemented through Flutter notification callbacks; deeper native service action handling would be stronger for killed-app scenarios.
+- Historical legacy shifts are preserved as recorded; they are not automatically migrated into the new order/trip model.
 
 ## Roadmap
 
@@ -232,6 +242,7 @@ High-priority improvements:
 - Native Android foreground service action handling for stronger killed-app behavior.
 - File picker for JSON import/export.
 - Automatic restaurant/place suggestions near detected stops.
+- Dedicated migration tool for converting legacy routes into the newer trip/order model.
 - Battery optimization guide screen per Android vendor.
 - Offline map cache.
 - More robust route smoothing and GPS confidence scoring.
