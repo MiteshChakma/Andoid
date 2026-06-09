@@ -2,7 +2,7 @@
 
 Android-first Flutter app for tracking food delivery shifts, routes, stops, wait time, earnings, and daily route history.
 
-This project was built with help from an AI coding agent in Codex. The app idea, workflow decisions, and feature requirements came from the delivery use case; Codex helped implement, debug, test, document, and package the Flutter Android app.
+This project was built with help from an AI coding agent in Codex. The app idea, workflow decisions, and feature requirements came from the delivery use case; Codex helped debug, test, document, and package the Flutter Android app.
 
 ## APK
 
