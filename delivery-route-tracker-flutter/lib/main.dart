@@ -1334,29 +1334,16 @@ class _TrackerPageState extends State<TrackerPage> {
     final shift = _activeShift;
     if (shift == null) return;
 
+    final endedAt = DateTime.now();
     setState(() {
       _activeShift = null;
       _stopDraft = null;
       _lastAutoSaveAt = null;
       _status = 'Saving shift...';
-      _now = DateTime.now();
+      _now = endedAt;
     });
 
-    await _positionSub?.cancel().timeout(
-          const Duration(seconds: 3),
-          onTimeout: () {},
-        );
-    _positionSub = null;
-    _locationStreamStoppedMode = false;
-    _clock?.cancel();
-    _clock = null;
-    if (_notificationsReady) {
-      await _notifications
-          .cancel(_trackingNotificationId)
-          .timeout(const Duration(seconds: 2), onTimeout: () {});
-    }
-
-    shift.endedAt = DateTime.now();
+    shift.endedAt = endedAt;
     shift.lastActivityAt = shift.endedAt!;
     shift.lifecycleEvents.add(
       DeliveryLifecycleEvent(
@@ -1374,16 +1361,43 @@ class _TrackerPageState extends State<TrackerPage> {
     if (shift.segments.isNotEmpty && shift.segments.last.endedAt == null) {
       shift.segments.last.endedAt = shift.endedAt;
     }
-    await _store.save(shift);
-    await _clearActiveShiftMarker();
-    await _loadHistory();
+
+    _clock?.cancel();
+    _clock = null;
+    _locationStreamStoppedMode = false;
+    await _positionSub?.cancel().timeout(
+          const Duration(seconds: 2),
+          onTimeout: () {},
+        );
+    _positionSub = null;
+
+    try {
+      await _store.save(shift).timeout(const Duration(seconds: 10));
+      await _clearActiveShiftMarker().timeout(const Duration(seconds: 3));
+      if (_notificationsReady) {
+        await _notifications
+            .cancel(_trackingNotificationId)
+            .timeout(const Duration(seconds: 2), onTimeout: () {});
+      }
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _activeShift = shift;
+        _status = 'Could not save shift. Try Stop again.';
+      });
+      _logDiagnostic('Shift save failed', error.toString());
+      return;
+    }
 
     if (!mounted) return;
-    setState(
-      () => _status = shift.segments.isEmpty
+    setState(() {
+      _savedShifts.removeWhere((item) => item.id == shift.id);
+      _savedShifts.insert(0, shift);
+      _status = shift.segments.isEmpty
           ? 'Shift saved without movement'
-          : 'Shift saved',
-    );
+          : 'Shift saved';
+    });
+    unawaited(_loadHistory());
   }
 
   @override
