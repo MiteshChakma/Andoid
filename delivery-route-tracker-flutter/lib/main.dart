@@ -123,6 +123,7 @@ class _TrackerPageState extends State<TrackerPage> {
   DateTime? _lastAutoSaveAt;
   DateTime _now = DateTime.now();
   DateTime _selectedDay = DateTime.now();
+  PerformancePeriod _performancePeriod = PerformancePeriod.day;
   String _status = 'Ready to track';
   PermissionSnapshot _permissions = const PermissionSnapshot();
   bool _notificationsReady = false;
@@ -945,6 +946,33 @@ class _TrackerPageState extends State<TrackerPage> {
         .toList();
   }
 
+  List<Shift> get _allVisibleShifts {
+    final shifts = [..._savedShifts];
+    final active = _activeShift;
+    if (active != null && !shifts.any((shift) => shift.id == active.id)) {
+      shifts.insert(0, active);
+    }
+    return shifts;
+  }
+
+  DateTime get _performancePeriodStart =>
+      performancePeriodStart(_selectedDay, _performancePeriod);
+
+  DateTime get _performancePeriodEnd =>
+      performancePeriodEnd(_selectedDay, _performancePeriod);
+
+  List<Shift> get _selectedPerformanceShifts {
+    final start = _performancePeriodStart;
+    final end = _performancePeriodEnd;
+    return _allVisibleShifts
+        .where((shift) => shift.overlapsRange(start, end))
+        .toList();
+  }
+
+  void _changePerformancePeriod(PerformancePeriod period) {
+    setState(() => _performancePeriod = period);
+  }
+
   void _changeSelectedDay(int days) {
     setState(() {
       _selectedDay = DateTime(
@@ -1519,9 +1547,14 @@ class _TrackerPageState extends State<TrackerPage> {
         _DayView(
           selectedDay: _selectedDay,
           shifts: _selectedDayShifts,
+          performanceShifts: _selectedPerformanceShifts,
+          performancePeriod: _performancePeriod,
+          performancePeriodStart: _performancePeriodStart,
+          performancePeriodEnd: _performancePeriodEnd,
           lastKnownPoint: _lastKnownPoint,
           onPreviousDay: () => _changeSelectedDay(-1),
           onNextDay: () => _changeSelectedDay(1),
+          onPerformancePeriodChanged: _changePerformancePeriod,
           onCopyCsv: _copySelectedDayCsv,
           onSaveCsv: _saveSelectedDayCsv,
           onPickDate: _pickCalendarDate,
@@ -2341,35 +2374,34 @@ class _StatCard extends StatelessWidget {
 }
 
 class _PerformanceSummary extends StatelessWidget {
-  const _PerformanceSummary({required this.shifts});
+  const _PerformanceSummary({
+    required this.shifts,
+    required this.period,
+    required this.periodStart,
+    required this.periodEnd,
+    required this.onPeriodChanged,
+  });
 
   final List<Shift> shifts;
+  final PerformancePeriod period;
+  final DateTime periodStart;
+  final DateTime periodEnd;
+  final ValueChanged<PerformancePeriod> onPeriodChanged;
 
   @override
   Widget build(BuildContext context) {
     final trips = shifts.expand((shift) => shift.segments).toList();
-    final totalWork = shifts.fold<Duration>(
-      Duration.zero,
-      (sum, shift) => sum + shift.duration,
-    );
-    final totalMoving = shifts.fold<Duration>(
-      Duration.zero,
-      (sum, shift) => sum + shift.movingDuration,
-    );
-    final totalWaiting = shifts.fold<Duration>(
-      Duration.zero,
-      (sum, shift) => sum + shift.waitDuration,
-    );
-    final distanceMeters = shifts.fold<double>(
-      0,
-      (sum, shift) => sum + shift.distanceMeters,
+    final activity = ActivityMetrics.fromShifts(
+      shifts,
+      periodStart: periodStart,
+      periodEnd: periodEnd,
     );
     final totalNet = shifts.fold<double>(
       0,
       (sum, shift) => sum + shift.netEarnings,
     );
-    final hours = totalWork.inSeconds / 3600;
-    final km = distanceMeters / 1000;
+    final hours = activity.totalShiftTime.inSeconds / 3600;
+    final km = activity.totalDistanceMeters / 1000;
     final woltNet = trips
         .where((trip) => trip.platform == DeliveryPlatform.wolt)
         .fold<double>(0, (sum, trip) => sum + trip.netEarnings);
@@ -2387,11 +2419,35 @@ class _PerformanceSummary extends StatelessWidget {
               children: [
                 const Icon(Icons.analytics_rounded),
                 const SizedBox(width: 8),
-                Text(
-                  'Performance',
-                  style: Theme.of(context).textTheme.titleSmall,
+                Expanded(
+                  child: Text(
+                    'Performance',
+                    style: Theme.of(context).textTheme.titleSmall,
+                  ),
                 ),
               ],
+            ),
+            const SizedBox(height: 8),
+            SegmentedButton<PerformancePeriod>(
+              segments: PerformancePeriod.values
+                  .map(
+                    (item) => ButtonSegment<PerformancePeriod>(
+                      value: item,
+                      label: Text(item.label),
+                      icon: Icon(item.icon),
+                    ),
+                  )
+                  .toList(),
+              selected: {period},
+              showSelectedIcon: false,
+              onSelectionChanged: (selection) {
+                if (selection.isNotEmpty) onPeriodChanged(selection.first);
+              },
+            ),
+            const SizedBox(height: 8),
+            Text(
+              performancePeriodLabel(period, periodStart, periodEnd),
+              style: Theme.of(context).textTheme.bodySmall,
             ),
             const SizedBox(height: 10),
             Wrap(
@@ -2399,20 +2455,58 @@ class _PerformanceSummary extends StatelessWidget {
               runSpacing: 8,
               children: [
                 _MiniMetric(
-                  label: 'Total hours',
-                  value: formatDuration(totalWork),
+                  label: 'Shift time',
+                  value: formatDuration(activity.totalShiftTime),
                 ),
                 _MiniMetric(
-                  label: 'Moving',
-                  value: formatDuration(totalMoving),
+                  label: 'Active orders',
+                  value: formatDuration(activity.activeDeliveryTime),
                 ),
                 _MiniMetric(
-                  label: 'Waiting',
-                  value: formatDuration(totalWaiting),
+                  label: 'Waiting no order',
+                  value: formatDuration(activity.waitingNoOrderTime),
                 ),
+                _MiniMetric(
+                  label: 'Wait ratio',
+                  value: '${activity.waitingPercentage.toStringAsFixed(0)}%',
+                ),
+                _MiniMetric(
+                  label: 'Waiting km',
+                  value:
+                      '${(activity.waitingDistanceMeters / 1000).toStringAsFixed(2)} km',
+                ),
+                _MiniMetric(
+                  label: 'Active km',
+                  value:
+                      '${(activity.activeDistanceMeters / 1000).toStringAsFixed(2)} km',
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(999),
+              child: LinearProgressIndicator(
+                minHeight: 8,
+                value: activity.activePercentage / 100,
+                backgroundColor:
+                    Theme.of(context).colorScheme.surfaceContainerHighest,
+              ),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              '${activity.activePercentage.toStringAsFixed(0)}% active / '
+              '${activity.waitingPercentage.toStringAsFixed(0)}% waiting',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            const SizedBox(height: 10),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
                 _MiniMetric(
                   label: 'Distance',
-                  value: '${km.toStringAsFixed(2)} km',
+                  value:
+                      '${(activity.totalDistanceMeters / 1000).toStringAsFixed(2)} km',
                 ),
                 _MiniMetric(label: 'Net', value: formatMoney(totalNet)),
                 _MiniMetric(
@@ -2774,9 +2868,14 @@ class _DayView extends StatelessWidget {
   const _DayView({
     required this.selectedDay,
     required this.shifts,
+    required this.performanceShifts,
+    required this.performancePeriod,
+    required this.performancePeriodStart,
+    required this.performancePeriodEnd,
     required this.lastKnownPoint,
     required this.onPreviousDay,
     required this.onNextDay,
+    required this.onPerformancePeriodChanged,
     required this.onCopyCsv,
     required this.onSaveCsv,
     required this.onPickDate,
@@ -2789,9 +2888,14 @@ class _DayView extends StatelessWidget {
 
   final DateTime selectedDay;
   final List<Shift> shifts;
+  final List<Shift> performanceShifts;
+  final PerformancePeriod performancePeriod;
+  final DateTime performancePeriodStart;
+  final DateTime performancePeriodEnd;
   final TrackPoint? lastKnownPoint;
   final VoidCallback onPreviousDay;
   final VoidCallback onNextDay;
+  final ValueChanged<PerformancePeriod> onPerformancePeriodChanged;
   final VoidCallback onCopyCsv;
   final VoidCallback onSaveCsv;
   final VoidCallback onPickDate;
@@ -2868,7 +2972,13 @@ class _DayView extends StatelessWidget {
           ],
         ),
         const SizedBox(height: 12),
-        _PerformanceSummary(shifts: shifts),
+        _PerformanceSummary(
+          shifts: performanceShifts,
+          period: performancePeriod,
+          periodStart: performancePeriodStart,
+          periodEnd: performancePeriodEnd,
+          onPeriodChanged: onPerformancePeriodChanged,
+        ),
         const SizedBox(height: 12),
         SizedBox(
           height: 320,
@@ -3653,6 +3763,13 @@ class Shift {
       );
 }
 
+extension ShiftRangeX on Shift {
+  bool overlapsRange(DateTime start, DateTime end) {
+    final shiftEnd = endedAt ?? DateTime.now();
+    return startedAt.isBefore(end) && shiftEnd.isAfter(start);
+  }
+}
+
 class DeliveryTrip {
   DeliveryTrip({
     required this.id,
@@ -3825,6 +3942,44 @@ enum DeliveryLifecycleStage {
 }
 
 extension DeliveryLifecycleStageX on DeliveryLifecycleStage {
+  bool get startsActiveOrderWindow => switch (this) {
+        DeliveryLifecycleStage.orderAccepted ||
+        DeliveryLifecycleStage.travelingToRestaurant ||
+        DeliveryLifecycleStage.atRestaurant ||
+        DeliveryLifecycleStage.orderPickedUp ||
+        DeliveryLifecycleStage.travelingToCustomer ||
+        DeliveryLifecycleStage.multipleOrdersActive ||
+        DeliveryLifecycleStage.delayedAtRestaurant ||
+        DeliveryLifecycleStage.customerUnavailable =>
+          true,
+        DeliveryLifecycleStage.shiftStarted ||
+        DeliveryLifecycleStage.shiftPaused ||
+        DeliveryLifecycleStage.shiftEnded ||
+        DeliveryLifecycleStage.waitingForOrder ||
+        DeliveryLifecycleStage.delivered ||
+        DeliveryLifecycleStage.orderCancelled =>
+          false,
+      };
+
+  bool get endsActiveOrderWindow => switch (this) {
+        DeliveryLifecycleStage.delivered ||
+        DeliveryLifecycleStage.orderCancelled ||
+        DeliveryLifecycleStage.waitingForOrder ||
+        DeliveryLifecycleStage.shiftPaused ||
+        DeliveryLifecycleStage.shiftEnded =>
+          true,
+        DeliveryLifecycleStage.shiftStarted ||
+        DeliveryLifecycleStage.orderAccepted ||
+        DeliveryLifecycleStage.travelingToRestaurant ||
+        DeliveryLifecycleStage.atRestaurant ||
+        DeliveryLifecycleStage.orderPickedUp ||
+        DeliveryLifecycleStage.travelingToCustomer ||
+        DeliveryLifecycleStage.multipleOrdersActive ||
+        DeliveryLifecycleStage.delayedAtRestaurant ||
+        DeliveryLifecycleStage.customerUnavailable =>
+          false,
+      };
+
   String get label => switch (this) {
         DeliveryLifecycleStage.shiftStarted => 'Shift started',
         DeliveryLifecycleStage.shiftPaused => 'Shift paused',
@@ -4158,6 +4313,194 @@ class DayTimelineEntry {
   final String subtitle;
 }
 
+enum PerformancePeriod { day, week, month }
+
+extension PerformancePeriodX on PerformancePeriod {
+  String get label => switch (this) {
+        PerformancePeriod.day => 'Day',
+        PerformancePeriod.week => 'Week',
+        PerformancePeriod.month => 'Month',
+      };
+
+  IconData get icon => switch (this) {
+        PerformancePeriod.day => Icons.today_rounded,
+        PerformancePeriod.week => Icons.view_week_rounded,
+        PerformancePeriod.month => Icons.calendar_month_rounded,
+      };
+}
+
+class TimeWindow {
+  const TimeWindow({required this.start, required this.end});
+
+  final DateTime start;
+  final DateTime end;
+
+  bool get isValid => end.isAfter(start);
+
+  bool contains(DateTime time) => !time.isBefore(start) && time.isBefore(end);
+
+  bool overlaps(TimeWindow other) =>
+      start.isBefore(other.end) && end.isAfter(other.start);
+
+  Duration overlapDuration(TimeWindow other) {
+    final overlapStart = start.isAfter(other.start) ? start : other.start;
+    final overlapEnd = end.isBefore(other.end) ? end : other.end;
+    if (!overlapEnd.isAfter(overlapStart)) return Duration.zero;
+    return overlapEnd.difference(overlapStart);
+  }
+
+  TimeWindow? clippedTo(TimeWindow other) {
+    final clippedStart = start.isAfter(other.start) ? start : other.start;
+    final clippedEnd = end.isBefore(other.end) ? end : other.end;
+    if (!clippedEnd.isAfter(clippedStart)) return null;
+    return TimeWindow(start: clippedStart, end: clippedEnd);
+  }
+}
+
+class ActivityMetrics {
+  const ActivityMetrics({
+    required this.totalShiftTime,
+    required this.activeDeliveryTime,
+    required this.waitingNoOrderTime,
+    required this.activeDistanceMeters,
+    required this.waitingDistanceMeters,
+  });
+
+  final Duration totalShiftTime;
+  final Duration activeDeliveryTime;
+  final Duration waitingNoOrderTime;
+  final double activeDistanceMeters;
+  final double waitingDistanceMeters;
+
+  double get totalDistanceMeters =>
+      activeDistanceMeters + waitingDistanceMeters;
+
+  double get activePercentage {
+    if (totalShiftTime.inSeconds <= 0) return 0;
+    return activeDeliveryTime.inSeconds / totalShiftTime.inSeconds * 100;
+  }
+
+  double get waitingPercentage {
+    if (totalShiftTime.inSeconds <= 0) return 0;
+    return waitingNoOrderTime.inSeconds / totalShiftTime.inSeconds * 100;
+  }
+
+  static ActivityMetrics fromShifts(
+    List<Shift> shifts, {
+    required DateTime periodStart,
+    required DateTime periodEnd,
+  }) {
+    final period = TimeWindow(start: periodStart, end: periodEnd);
+    var totalShiftTime = Duration.zero;
+    var activeDeliveryTime = Duration.zero;
+    var activeDistanceMeters = 0.0;
+    var waitingDistanceMeters = 0.0;
+
+    for (final shift in shifts) {
+      final shiftEnd = shift.endedAt ?? DateTime.now();
+      final shiftWindow = TimeWindow(start: shift.startedAt, end: shiftEnd);
+      final clippedShift = shiftWindow.clippedTo(period);
+      if (clippedShift == null) continue;
+
+      totalShiftTime += clippedShift.end.difference(clippedShift.start);
+      final activeWindows = activeOrderWindowsForShift(shift, shiftEnd)
+          .map((window) => window.clippedTo(clippedShift))
+          .nonNulls
+          .toList();
+      final mergedActiveWindows = mergeTimeWindows(activeWindows);
+      for (final window in mergedActiveWindows) {
+        activeDeliveryTime += window.end.difference(window.start);
+      }
+
+      final points = shift.points
+          .where((point) =>
+              !point.timestamp.isBefore(period.start) &&
+              !point.timestamp.isAfter(period.end))
+          .toList()
+        ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
+      for (var i = 1; i < points.length; i++) {
+        final previous = points[i - 1];
+        final current = points[i];
+        final segmentDistance = haversineMeters(previous, current);
+        if (segmentDistance <= 0) continue;
+        final midpointMillis = (previous.timestamp.millisecondsSinceEpoch +
+                current.timestamp.millisecondsSinceEpoch) ~/
+            2;
+        final midpoint = DateTime.fromMillisecondsSinceEpoch(midpointMillis);
+        final isActive = mergedActiveWindows.any(
+          (window) => window.contains(midpoint),
+        );
+        if (isActive) {
+          activeDistanceMeters += segmentDistance;
+        } else {
+          waitingDistanceMeters += segmentDistance;
+        }
+      }
+    }
+
+    final waitingNoOrderTime = totalShiftTime - activeDeliveryTime;
+    return ActivityMetrics(
+      totalShiftTime: totalShiftTime,
+      activeDeliveryTime: activeDeliveryTime,
+      waitingNoOrderTime:
+          waitingNoOrderTime.isNegative ? Duration.zero : waitingNoOrderTime,
+      activeDistanceMeters: activeDistanceMeters,
+      waitingDistanceMeters: waitingDistanceMeters,
+    );
+  }
+}
+
+List<TimeWindow> activeOrderWindowsForShift(Shift shift, DateTime fallbackEnd) {
+  final orderWindows = <TimeWindow>[];
+  for (final trip in shift.deliveryTrips) {
+    final tripEnd = trip.endedAt ?? shift.endedAt ?? fallbackEnd;
+    for (final order in trip.orders) {
+      final end = order.deliveredAt ?? order.cancelledAt ?? tripEnd;
+      final window = TimeWindow(start: order.acceptedAt, end: end);
+      if (window.isValid) orderWindows.add(window);
+    }
+  }
+  if (orderWindows.isNotEmpty) return mergeTimeWindows(orderWindows);
+
+  final lifecycleWindows = <TimeWindow>[];
+  DateTime? activeStartedAt;
+  final events = [...shift.lifecycleEvents]
+    ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
+  for (final event in events) {
+    if (event.stage.startsActiveOrderWindow) {
+      activeStartedAt ??= event.timestamp;
+    }
+    if (event.stage.endsActiveOrderWindow && activeStartedAt != null) {
+      final window = TimeWindow(start: activeStartedAt, end: event.timestamp);
+      if (window.isValid) lifecycleWindows.add(window);
+      activeStartedAt = null;
+    }
+  }
+  if (activeStartedAt != null) {
+    final window = TimeWindow(start: activeStartedAt, end: fallbackEnd);
+    if (window.isValid) lifecycleWindows.add(window);
+  }
+  return mergeTimeWindows(lifecycleWindows);
+}
+
+List<TimeWindow> mergeTimeWindows(List<TimeWindow> windows) {
+  if (windows.isEmpty) return const [];
+  final sorted = [...windows]..sort((a, b) => a.start.compareTo(b.start));
+  final merged = <TimeWindow>[sorted.first];
+  for (final window in sorted.skip(1)) {
+    final previous = merged.last;
+    if (!window.start.isAfter(previous.end)) {
+      merged[merged.length - 1] = TimeWindow(
+        start: previous.start,
+        end: window.end.isAfter(previous.end) ? window.end : previous.end,
+      );
+    } else {
+      merged.add(window);
+    }
+  }
+  return merged;
+}
+
 class DiagnosticEntry {
   DiagnosticEntry({
     required this.title,
@@ -4304,6 +4647,44 @@ String formatMoney(double value) {
 
 bool isSameDay(DateTime a, DateTime b) {
   return a.year == b.year && a.month == b.month && a.day == b.day;
+}
+
+DateTime performancePeriodStart(
+    DateTime selectedDay, PerformancePeriod period) {
+  final dayStart = DateTime(
+    selectedDay.year,
+    selectedDay.month,
+    selectedDay.day,
+  );
+  return switch (period) {
+    PerformancePeriod.day => dayStart,
+    PerformancePeriod.week => dayStart.subtract(
+        Duration(days: dayStart.weekday - DateTime.monday),
+      ),
+    PerformancePeriod.month => DateTime(selectedDay.year, selectedDay.month),
+  };
+}
+
+DateTime performancePeriodEnd(DateTime selectedDay, PerformancePeriod period) {
+  final start = performancePeriodStart(selectedDay, period);
+  return switch (period) {
+    PerformancePeriod.day => start.add(const Duration(days: 1)),
+    PerformancePeriod.week => start.add(const Duration(days: 7)),
+    PerformancePeriod.month => DateTime(start.year, start.month + 1),
+  };
+}
+
+String performancePeriodLabel(
+  PerformancePeriod period,
+  DateTime start,
+  DateTime end,
+) {
+  return switch (period) {
+    PerformancePeriod.day => DateFormat('MMM d, yyyy').format(start),
+    PerformancePeriod.week =>
+      '${DateFormat('MMM d').format(start)} - ${DateFormat('MMM d, yyyy').format(end.subtract(const Duration(days: 1)))}',
+    PerformancePeriod.month => DateFormat('MMMM yyyy').format(start),
+  };
 }
 
 String pointStatus(TrackPoint point, List<Shift> shifts) {

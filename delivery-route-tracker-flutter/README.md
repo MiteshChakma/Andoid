@@ -283,7 +283,8 @@ Future migration may convert older route segments into the new trip/order model,
 - Google Maps Timeline-style day route view.
 - Timeline playback with slider and tappable point details.
 - Route verification: confirm detected trips and stops after review.
-- Daily performance analytics.
+- Daily, weekly, and monthly performance analytics.
+- Idle-vs-active delivery analysis, including active delivery time, no-order waiting time, waiting percentage, waiting distance, and active delivery distance.
 - Local diagnostics panel for GPS errors, permissions, notification status, and tracking service state.
 - Map controls for zoom, recenter, and fullscreen active route inspection.
 - Local-only storage with CSV, JSON, GPX, and KML export options.
@@ -304,6 +305,7 @@ These are feature milestones for this prototype. The package version in `pubspec
 | v0.7 | Delivery workflow | Lifecycle buttons, notification actions, stop classification prompts, JSON backup/restore. |
 | v0.8 | Production hardening | GPS quality filtering, active shift autosave, route verification, timeline playback, performance analytics, diagnostics, GPX/KML exports. |
 | v0.9 | Shift continuity and multi-order model | Accidental-close recovery, configurable recovery grace period, expanded lifecycle statuses, order/trip data model, stacked delivery support, active order count, trip closure rules, improved map markers and controls. |
+| v0.10 | Idle and active performance analytics | Calendar Performance period switch for day/week/month, active-order time calculation, no-order waiting time, waiting-vs-active ratio, waiting distance, and active delivery distance. |
 
 ## Working Process
 
@@ -326,7 +328,7 @@ These are feature milestones for this prototype. The package version in `pubspec
 10. Stop the shift only when finished.
 11. Review detected trips and stops in Calendar.
 12. Add restaurant names, platform, and earnings.
-13. Check daily earnings and performance analytics.
+13. Check daily earnings and day/week/month performance analytics.
 14. Export data as CSV, JSON, GPX, or KML.
 
 ## Analytics
@@ -336,13 +338,26 @@ The app calculates:
 - Total working hours
 - Moving time
 - Waiting time
+- Active delivery time
+- Waiting time with no active order
+- Waiting time vs active delivery time ratio
 - Distance traveled
+- Distance traveled while waiting for orders
+- Distance traveled during active deliveries
 - Total gross earnings
 - Total net earnings
 - Earnings per hour
 - Earnings per kilometer
 - Wolt totals
 - Uber Eats gross and net totals
+
+Performance can be reviewed for:
+
+- Selected day
+- Selected week
+- Selected month
+
+Active delivery time is calculated from structured order data when available, using each order's accepted-to-delivered or accepted-to-cancelled interval. Older records without structured order data fall back to lifecycle events such as Order accepted, Picked up, Delivered, Cancelled, and Waiting for order.
 
 Uber Eats formula:
 
