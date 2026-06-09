@@ -160,8 +160,7 @@ class _TrackerPageState extends State<TrackerPage> {
     Shift? recoveredShift;
     if (activeId != null) {
       for (final shift in shifts) {
-        final recoverable =
-            shift.id == activeId &&
+        final recoverable = shift.id == activeId &&
             shift.endedAt == null &&
             DateTime.now().difference(shift.lastActivityAt) <=
                 Duration(minutes: graceMinutes);
@@ -177,9 +176,8 @@ class _TrackerPageState extends State<TrackerPage> {
       _shiftRecoveryGraceMinutes = graceMinutes;
       if (recoveredShift != null) {
         _activeShift = recoveredShift;
-        _lastKnownPoint = recoveredShift.points.isEmpty
-            ? null
-            : recoveredShift.points.last;
+        _lastKnownPoint =
+            recoveredShift.points.isEmpty ? null : recoveredShift.points.last;
         _status = 'Recovered active shift';
         _now = DateTime.now();
       }
@@ -201,13 +199,12 @@ class _TrackerPageState extends State<TrackerPage> {
       _showTrackingNotification();
     });
     try {
-      _positionSub =
-          Geolocator.getPositionStream(
-            locationSettings: _locationSettings(),
-          ).listen(
-            _handlePosition,
-            onError: (error) => _recordGpsError(error.toString()),
-          );
+      _positionSub = Geolocator.getPositionStream(
+        locationSettings: _locationSettings(),
+      ).listen(
+        _handlePosition,
+        onError: (error) => _recordGpsError(error.toString()),
+      );
       _locationStreamStoppedMode = _stopDraft?.confirmed == true;
       _logDiagnostic('Shift recovery', 'Recovered shift ${shift.id}');
     } catch (error) {
@@ -276,11 +273,11 @@ class _TrackerPageState extends State<TrackerPage> {
 
     final settings = _locationSettings();
     try {
-      _positionSub = Geolocator.getPositionStream(locationSettings: settings)
-          .listen(
-            _handlePosition,
-            onError: (error) => _recordGpsError(error.toString()),
-          );
+      _positionSub =
+          Geolocator.getPositionStream(locationSettings: settings).listen(
+        _handlePosition,
+        onError: (error) => _recordGpsError(error.toString()),
+      );
       _locationStreamStoppedMode = false;
       _logDiagnostic(
         'Background service',
@@ -599,17 +596,16 @@ class _TrackerPageState extends State<TrackerPage> {
     if (_locationStreamStoppedMode == shouldUseStoppedMode) return;
     _locationStreamStoppedMode = shouldUseStoppedMode;
     await _positionSub?.cancel().timeout(
-      const Duration(seconds: 3),
-      onTimeout: () {},
-    );
-    if (_activeShift == null) return;
-    _positionSub =
-        Geolocator.getPositionStream(
-          locationSettings: _locationSettings(),
-        ).listen(
-          _handlePosition,
-          onError: (error) => _recordGpsError(error.toString()),
+          const Duration(seconds: 3),
+          onTimeout: () {},
         );
+    if (_activeShift == null) return;
+    _positionSub = Geolocator.getPositionStream(
+      locationSettings: _locationSettings(),
+    ).listen(
+      _handlePosition,
+      onError: (error) => _recordGpsError(error.toString()),
+    );
   }
 
   Future<void> _showTrackingNotification() async {
@@ -1099,18 +1095,17 @@ class _TrackerPageState extends State<TrackerPage> {
     final shift = _activeShift;
     if (shift != null) {
       await _positionSub?.cancel().timeout(
-        const Duration(seconds: 3),
-        onTimeout: () {},
-      );
+            const Duration(seconds: 3),
+            onTimeout: () {},
+          );
       _locationStreamStoppedMode =
           _batterySafeMode && _stopDraft?.confirmed == true;
-      _positionSub =
-          Geolocator.getPositionStream(
-            locationSettings: _locationSettings(),
-          ).listen(
-            _handlePosition,
-            onError: (error) => _recordGpsError(error.toString()),
-          );
+      _positionSub = Geolocator.getPositionStream(
+        locationSettings: _locationSettings(),
+      ).listen(
+        _handlePosition,
+        onError: (error) => _recordGpsError(error.toString()),
+      );
       await _showTrackingNotification();
     }
   }
@@ -1166,9 +1161,8 @@ class _TrackerPageState extends State<TrackerPage> {
       text: segment.pickupRestaurantName,
     );
     final earningsController = TextEditingController(
-      text: segment.earnings == null
-          ? ''
-          : segment.earnings!.toStringAsFixed(2),
+      text:
+          segment.earnings == null ? '' : segment.earnings!.toStringAsFixed(2),
     );
     var platform = segment.platform;
 
@@ -1349,9 +1343,9 @@ class _TrackerPageState extends State<TrackerPage> {
     });
 
     await _positionSub?.cancel().timeout(
-      const Duration(seconds: 3),
-      onTimeout: () {},
-    );
+          const Duration(seconds: 3),
+          onTimeout: () {},
+        );
     _positionSub = null;
     _locationStreamStoppedMode = false;
     _clock?.cancel();
@@ -1448,42 +1442,19 @@ class _TrackerPageState extends State<TrackerPage> {
 
   Widget _buildTrackerTab(Shift? shift) {
     return ListView(
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+      padding: const EdgeInsets.fromLTRB(16, 10, 16, 24),
       children: [
-        Text(
-          _status,
-          style: Theme.of(
-            context,
-          ).textTheme.labelLarge?.copyWith(color: const Color(0xff0f766e)),
+        _TrackerStatusHeader(
+          status: _status,
+          shift: shift,
+          now: _now,
+          isTracking: _isTracking,
+          onStart: _startShift,
+          onStop: _stopShift,
         ),
         const SizedBox(height: 12),
-        Row(
-          children: [
-            Expanded(
-              child: FilledButton.icon(
-                onPressed: _isTracking ? null : _startShift,
-                icon: const Icon(Icons.play_arrow_rounded),
-                label: const Text('Start shift'),
-              ),
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: FilledButton.icon(
-                style: FilledButton.styleFrom(
-                  backgroundColor: const Color(0xffdc2626),
-                ),
-                onPressed: _isTracking ? _stopShift : null,
-                icon: const Icon(Icons.stop_rounded),
-                label: const Text('Stop'),
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 14),
-        _LifecyclePanel(shift: shift, onStage: _recordLifecycleStage),
-        const SizedBox(height: 14),
         SizedBox(
-          height: 300,
+          height: 260,
           child: DecoratedBox(
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(8),
@@ -1497,10 +1468,23 @@ class _TrackerPageState extends State<TrackerPage> {
         ),
         const SizedBox(height: 12),
         _StatsGrid(shift: shift, now: _now),
-        const SizedBox(height: 22),
-        Text('Current shift', style: Theme.of(context).textTheme.titleMedium),
-        const SizedBox(height: 8),
-        _Timeline(shift: shift, onEditStop: _editStopLabel),
+        const SizedBox(height: 12),
+        _LifecyclePanel(shift: shift, onStage: _recordLifecycleStage),
+        const SizedBox(height: 18),
+        ExpansionTile(
+          tilePadding: EdgeInsets.zero,
+          leading: const Icon(Icons.timeline_rounded),
+          title: Text(
+            'Current shift timeline',
+            style: Theme.of(context).textTheme.titleMedium,
+          ),
+          children: [
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: _Timeline(shift: shift, onEditStop: _editStopLabel),
+            ),
+          ],
+        ),
       ],
     );
   }
@@ -1907,8 +1891,8 @@ class _DiagnosticsPanel extends StatelessWidget {
             label: 'Service status',
             value: trackingActive
                 ? (backgroundStoppedMode
-                      ? 'Active, stopped mode'
-                      : 'Active, moving mode')
+                    ? 'Active, stopped mode'
+                    : 'Active, moving mode')
                 : 'Inactive',
           ),
           _DiagnosticRow(
@@ -1943,6 +1927,89 @@ class _DiagnosticRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return ListTile(dense: true, title: Text(label), subtitle: Text(value));
+  }
+}
+
+class _TrackerStatusHeader extends StatelessWidget {
+  const _TrackerStatusHeader({
+    required this.status,
+    required this.shift,
+    required this.now,
+    required this.isTracking,
+    required this.onStart,
+    required this.onStop,
+  });
+
+  final String status;
+  final Shift? shift;
+  final DateTime now;
+  final bool isTracking;
+  final VoidCallback onStart;
+  final VoidCallback onStop;
+
+  @override
+  Widget build(BuildContext context) {
+    final current = shift?.currentStage?.stage.label ?? 'Not tracking';
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  isTracking
+                      ? Icons.radio_button_checked_rounded
+                      : Icons.trip_origin_rounded,
+                  color: isTracking
+                      ? const Color(0xff0f766e)
+                      : Theme.of(context).disabledColor,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(current,
+                          style: Theme.of(context).textTheme.titleMedium),
+                      Text(status,
+                          style: Theme.of(context).textTheme.bodySmall),
+                    ],
+                  ),
+                ),
+                Text(
+                  formatDuration(shift?.durationUntil(now) ?? Duration.zero),
+                  style: Theme.of(context).textTheme.labelLarge,
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: FilledButton.icon(
+                    onPressed: isTracking ? null : onStart,
+                    icon: const Icon(Icons.play_arrow_rounded),
+                    label: const Text('Start shift'),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: FilledButton.icon(
+                    style: FilledButton.styleFrom(
+                        backgroundColor: const Color(0xffdc2626)),
+                    onPressed: isTracking ? onStop : null,
+                    icon: const Icon(Icons.stop_rounded),
+                    label: const Text('End shift'),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }
 
@@ -1993,9 +2060,17 @@ class _LifecyclePanel extends StatelessWidget {
   Widget build(BuildContext context) {
     final current = shift?.currentStage?.stage;
     final trip = shift?.activeDeliveryTrip;
+    final nextStages = _nextStages(current);
+    final exceptionStages = [
+      DeliveryLifecycleStage.multipleOrdersActive,
+      DeliveryLifecycleStage.delayedAtRestaurant,
+      DeliveryLifecycleStage.customerUnavailable,
+      DeliveryLifecycleStage.orderCancelled,
+      DeliveryLifecycleStage.shiftPaused,
+    ];
     final history = (shift?.lifecycleEvents ?? const <DeliveryLifecycleEvent>[])
         .reversed
-        .take(8)
+        .take(6)
         .toList()
         .reversed
         .toList();
@@ -2009,97 +2084,196 @@ class _LifecyclePanel extends StatelessWidget {
               children: [
                 const Icon(Icons.delivery_dining_rounded),
                 const SizedBox(width: 8),
-                Text(
-                  'Delivery lifecycle',
-                  style: Theme.of(context).textTheme.titleSmall,
-                ),
-                const Spacer(),
-                Text(
-                  current?.label ?? 'Not started',
-                  style: Theme.of(context).textTheme.labelMedium,
-                ),
-              ],
-            ),
-            const SizedBox(height: 10),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                _MiniMetric(
-                  label: 'Active orders',
-                  value: '${shift?.activeOrderCount ?? 0}',
-                ),
-                _MiniMetric(
-                  label: 'Trip ID',
-                  value: trip?.id.split('-').last ?? '-',
-                ),
-                _MiniMetric(
-                  label: 'Trip start',
-                  value: trip == null
-                      ? '-'
-                      : DateFormat('HH:mm').format(trip.startedAt),
-                ),
-                _MiniMetric(
-                  label: 'Active time',
-                  value: trip == null
-                      ? '0m 00s'
-                      : formatDuration(
-                          DateTime.now().difference(trip.startedAt),
-                        ),
-                ),
-                _MiniMetric(
-                  label: 'Distance',
-                  value:
-                      '${((shift?.distanceMeters ?? 0) / 1000).toStringAsFixed(2)} km',
-                ),
-              ],
-            ),
-            const SizedBox(height: 10),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: DeliveryLifecycleStage.values
-                  .where((stage) => stage != DeliveryLifecycleStage.shiftEnded)
-                  .map((stage) {
-                    final selected = current == stage;
-                    return ActionChip(
-                      avatar: Icon(stage.icon, size: 18),
-                      label: Text(stage.label),
-                      onPressed: shift == null ? null : () => onStage(stage),
-                      backgroundColor: selected
-                          ? Theme.of(context).colorScheme.primaryContainer
-                          : null,
-                      labelStyle: selected
-                          ? TextStyle(
-                              color: Theme.of(
-                                context,
-                              ).colorScheme.onPrimaryContainer,
-                            )
-                          : null,
-                    );
-                  })
-                  .toList(),
-            ),
-            if (history.isNotEmpty) ...[
-              const SizedBox(height: 12),
-              Text(
-                'Status history',
-                style: Theme.of(context).textTheme.labelLarge,
-              ),
-              const SizedBox(height: 4),
-              ...history.map(
-                (event) => Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 2),
-                  child: Text(
-                    '${DateFormat('HH:mm').format(event.timestamp)} - ${event.stage.label}',
-                    style: Theme.of(context).textTheme.bodySmall,
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Delivery workflow',
+                        style: Theme.of(context).textTheme.titleSmall,
+                      ),
+                      Text(
+                        current?.label ?? 'Start a shift to begin',
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                    ],
                   ),
                 ),
+                PopupMenuButton<DeliveryLifecycleStage>(
+                  tooltip: 'More statuses',
+                  enabled: shift != null,
+                  icon: const Icon(Icons.more_vert_rounded),
+                  onSelected: onStage,
+                  itemBuilder: (context) => exceptionStages
+                      .map(
+                        (stage) => PopupMenuItem(
+                          value: stage,
+                          child: ListTile(
+                            dense: true,
+                            leading: Icon(stage.icon),
+                            title: Text(stage.label),
+                          ),
+                        ),
+                      )
+                      .toList(),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            DecoratedBox(
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.all(10),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: _LifecycleFact(
+                        label: 'Orders',
+                        value: '${shift?.activeOrderCount ?? 0}',
+                      ),
+                    ),
+                    Expanded(
+                      child: _LifecycleFact(
+                        label: 'Trip',
+                        value: trip?.id.split('-').last ?? '-',
+                      ),
+                    ),
+                    Expanded(
+                      child: _LifecycleFact(
+                        label: 'Started',
+                        value: trip == null
+                            ? '-'
+                            : DateFormat('HH:mm').format(trip.startedAt),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            Text('Next actions', style: Theme.of(context).textTheme.labelLarge),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: nextStages.map((stage) {
+                final selected = current == stage;
+                return ActionChip(
+                  avatar: Icon(stage.icon, size: 18),
+                  label: Text(stage.label),
+                  onPressed: shift == null ? null : () => onStage(stage),
+                  backgroundColor: selected
+                      ? Theme.of(context).colorScheme.primaryContainer
+                      : null,
+                );
+              }).toList(),
+            ),
+            if (history.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              ExpansionTile(
+                tilePadding: EdgeInsets.zero,
+                dense: true,
+                title: const Text('Recent status history'),
+                children: history
+                    .map(
+                      (event) => ListTile(
+                        dense: true,
+                        leading: Icon(event.stage.icon),
+                        title: Text(event.stage.label),
+                        trailing:
+                            Text(DateFormat('HH:mm').format(event.timestamp)),
+                      ),
+                    )
+                    .toList(),
               ),
             ],
           ],
         ),
       ),
+    );
+  }
+
+  List<DeliveryLifecycleStage> _nextStages(DeliveryLifecycleStage? current) {
+    return switch (current) {
+      null => [
+          DeliveryLifecycleStage.waitingForOrder,
+          DeliveryLifecycleStage.orderAccepted,
+        ],
+      DeliveryLifecycleStage.shiftStarted ||
+      DeliveryLifecycleStage.waitingForOrder =>
+        [
+          DeliveryLifecycleStage.orderAccepted,
+          DeliveryLifecycleStage.travelingToRestaurant,
+        ],
+      DeliveryLifecycleStage.orderAccepted => [
+          DeliveryLifecycleStage.travelingToRestaurant,
+          DeliveryLifecycleStage.atRestaurant,
+        ],
+      DeliveryLifecycleStage.travelingToRestaurant => [
+          DeliveryLifecycleStage.atRestaurant,
+          DeliveryLifecycleStage.orderPickedUp,
+        ],
+      DeliveryLifecycleStage.atRestaurant ||
+      DeliveryLifecycleStage.delayedAtRestaurant =>
+        [
+          DeliveryLifecycleStage.orderPickedUp,
+          DeliveryLifecycleStage.travelingToCustomer,
+        ],
+      DeliveryLifecycleStage.orderPickedUp ||
+      DeliveryLifecycleStage.multipleOrdersActive =>
+        [
+          DeliveryLifecycleStage.travelingToCustomer,
+          DeliveryLifecycleStage.orderAccepted,
+        ],
+      DeliveryLifecycleStage.travelingToCustomer ||
+      DeliveryLifecycleStage.customerUnavailable =>
+        [
+          DeliveryLifecycleStage.delivered,
+          DeliveryLifecycleStage.orderAccepted,
+        ],
+      DeliveryLifecycleStage.delivered => [
+          DeliveryLifecycleStage.waitingForOrder,
+          DeliveryLifecycleStage.orderAccepted,
+        ],
+      DeliveryLifecycleStage.shiftPaused => [
+          DeliveryLifecycleStage.waitingForOrder,
+          DeliveryLifecycleStage.orderAccepted,
+        ],
+      DeliveryLifecycleStage.orderCancelled => [
+          DeliveryLifecycleStage.waitingForOrder,
+          DeliveryLifecycleStage.orderAccepted,
+        ],
+      DeliveryLifecycleStage.shiftEnded => [
+          DeliveryLifecycleStage.shiftStarted,
+        ],
+    };
+  }
+}
+
+class _LifecycleFact extends StatelessWidget {
+  const _LifecycleFact({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label, style: Theme.of(context).textTheme.labelSmall),
+        Text(
+          value,
+          overflow: TextOverflow.ellipsis,
+          style: Theme.of(context)
+              .textTheme
+              .titleSmall
+              ?.copyWith(fontWeight: FontWeight.w700),
+        ),
+      ],
     );
   }
 }
@@ -2447,8 +2621,7 @@ class _TimelinePlaybackState extends State<_TimelinePlayback> {
                     ),
                     initialZoom: visible.length > 1 ? 14 : 13,
                     interactionOptions: const InteractionOptions(
-                      flags:
-                          InteractiveFlag.drag |
+                      flags: InteractiveFlag.drag |
                           InteractiveFlag.pinchZoom |
                           InteractiveFlag.doubleTapZoom,
                     ),
@@ -2794,9 +2967,8 @@ class _DayShiftCard extends StatelessWidget {
                           ? Icons.verified_rounded
                           : Icons.check_circle_outline_rounded,
                     ),
-                    onPressed: segment.reviewed
-                        ? null
-                        : () => onConfirmTrip(segment),
+                    onPressed:
+                        segment.reviewed ? null : () => onConfirmTrip(segment),
                   ),
                   IconButton(
                     tooltip: 'Edit trip',
@@ -2827,9 +2999,8 @@ class _DayShiftCard extends StatelessWidget {
                             ? Icons.verified_rounded
                             : Icons.check_circle_outline_rounded,
                       ),
-                      onPressed: stop.reviewed
-                          ? null
-                          : () => onConfirmStop(stop),
+                      onPressed:
+                          stop.reviewed ? null : () => onConfirmStop(stop),
                     ),
                     IconButton(
                       tooltip: 'Edit stop',
@@ -2938,9 +3109,8 @@ class _RoutePreviewState extends State<RoutePreview> {
 
   @override
   Widget build(BuildContext context) {
-    final centerPoint = widget.points.isNotEmpty
-        ? widget.points.last
-        : widget.lastKnownPoint;
+    final centerPoint =
+        widget.points.isNotEmpty ? widget.points.last : widget.lastKnownPoint;
     final center = centerPoint == null
         ? const LatLng(61.4978, 23.7610)
         : LatLng(centerPoint.latitude, centerPoint.longitude);
@@ -2962,8 +3132,7 @@ class _RoutePreviewState extends State<RoutePreview> {
               initialCenter: center,
               initialZoom: route.length > 1 ? 15 : 13,
               interactionOptions: const InteractionOptions(
-                flags:
-                    InteractiveFlag.drag |
+                flags: InteractiveFlag.drag |
                     InteractiveFlag.pinchZoom |
                     InteractiveFlag.doubleTapZoom,
               ),
@@ -3146,9 +3315,8 @@ class DayTimelineMap extends StatelessWidget {
     final center = centerPoint == null
         ? const LatLng(61.4978, 23.7610)
         : LatLng(centerPoint.latitude, centerPoint.longitude);
-    final route = points
-        .map((point) => LatLng(point.latitude, point.longitude))
-        .toList();
+    final route =
+        points.map((point) => LatLng(point.latitude, point.longitude)).toList();
 
     return ClipRRect(
       borderRadius: BorderRadius.circular(8),
@@ -3160,8 +3328,7 @@ class DayTimelineMap extends StatelessWidget {
           initialCenter: center,
           initialZoom: route.length > 1 ? 13 : 12,
           interactionOptions: const InteractionOptions(
-            flags:
-                InteractiveFlag.drag |
+            flags: InteractiveFlag.drag |
                 InteractiveFlag.pinchZoom |
                 InteractiveFlag.doubleTapZoom,
           ),
@@ -3315,12 +3482,12 @@ class Shift {
     List<DeliveryTrip>? deliveryTrips,
     DateTime? lastActivityAt,
     this.tripClosureGraceMinutes = 10,
-  }) : points = points ?? [],
-       segments = segments ?? [],
-       stops = stops ?? [],
-       lifecycleEvents = lifecycleEvents ?? [],
-       deliveryTrips = deliveryTrips ?? [],
-       lastActivityAt = lastActivityAt ?? endedAt ?? startedAt;
+  })  : points = points ?? [],
+        segments = segments ?? [],
+        stops = stops ?? [],
+        lifecycleEvents = lifecycleEvents ?? [],
+        deliveryTrips = deliveryTrips ?? [],
+        lastActivityAt = lastActivityAt ?? endedAt ?? startedAt;
 
   final String id;
   final DateTime startedAt;
@@ -3421,45 +3588,46 @@ class Shift {
   }
 
   Map<String, dynamic> toJson() => {
-    'id': id,
-    'startedAt': startedAt.toIso8601String(),
-    'endedAt': endedAt?.toIso8601String(),
-    'points': points.map((p) => p.toJson()).toList(),
-    'segments': segments.map((s) => s.toJson()).toList(),
-    'stops': stops.map((s) => s.toJson()).toList(),
-    'lifecycleEvents': lifecycleEvents.map((e) => e.toJson()).toList(),
-    'deliveryTrips': deliveryTrips.map((t) => t.toJson()).toList(),
-    'lastActivityAt': lastActivityAt.toIso8601String(),
-    'tripClosureGraceMinutes': tripClosureGraceMinutes,
-  };
+        'id': id,
+        'startedAt': startedAt.toIso8601String(),
+        'endedAt': endedAt?.toIso8601String(),
+        'points': points.map((p) => p.toJson()).toList(),
+        'segments': segments.map((s) => s.toJson()).toList(),
+        'stops': stops.map((s) => s.toJson()).toList(),
+        'lifecycleEvents': lifecycleEvents.map((e) => e.toJson()).toList(),
+        'deliveryTrips': deliveryTrips.map((t) => t.toJson()).toList(),
+        'lastActivityAt': lastActivityAt.toIso8601String(),
+        'tripClosureGraceMinutes': tripClosureGraceMinutes,
+      };
 
   static Shift fromJson(Map<String, dynamic> json) => Shift(
-    id: json['id'] as String,
-    startedAt: DateTime.parse(json['startedAt'] as String),
-    endedAt: json['endedAt'] == null
-        ? null
-        : DateTime.parse(json['endedAt'] as String),
-    points: (json['points'] as List? ?? [])
-        .map((p) => TrackPoint.fromJson(p as Map<String, dynamic>))
-        .toList(),
-    segments: (json['segments'] as List? ?? [])
-        .map((s) => RouteSegment.fromJson(s as Map<String, dynamic>))
-        .toList(),
-    stops: (json['stops'] as List? ?? [])
-        .map((s) => StopEvent.fromJson(s as Map<String, dynamic>))
-        .toList(),
-    lifecycleEvents: (json['lifecycleEvents'] as List? ?? [])
-        .map((e) => DeliveryLifecycleEvent.fromJson(e as Map<String, dynamic>))
-        .toList(),
-    deliveryTrips: (json['deliveryTrips'] as List? ?? [])
-        .map((t) => DeliveryTrip.fromJson(t as Map<String, dynamic>))
-        .toList(),
-    lastActivityAt: json['lastActivityAt'] == null
-        ? null
-        : DateTime.parse(json['lastActivityAt'] as String),
-    tripClosureGraceMinutes:
-        (json['tripClosureGraceMinutes'] as num?)?.toInt() ?? 10,
-  );
+        id: json['id'] as String,
+        startedAt: DateTime.parse(json['startedAt'] as String),
+        endedAt: json['endedAt'] == null
+            ? null
+            : DateTime.parse(json['endedAt'] as String),
+        points: (json['points'] as List? ?? [])
+            .map((p) => TrackPoint.fromJson(p as Map<String, dynamic>))
+            .toList(),
+        segments: (json['segments'] as List? ?? [])
+            .map((s) => RouteSegment.fromJson(s as Map<String, dynamic>))
+            .toList(),
+        stops: (json['stops'] as List? ?? [])
+            .map((s) => StopEvent.fromJson(s as Map<String, dynamic>))
+            .toList(),
+        lifecycleEvents: (json['lifecycleEvents'] as List? ?? [])
+            .map((e) =>
+                DeliveryLifecycleEvent.fromJson(e as Map<String, dynamic>))
+            .toList(),
+        deliveryTrips: (json['deliveryTrips'] as List? ?? [])
+            .map((t) => DeliveryTrip.fromJson(t as Map<String, dynamic>))
+            .toList(),
+        lastActivityAt: json['lastActivityAt'] == null
+            ? null
+            : DateTime.parse(json['lastActivityAt'] as String),
+        tripClosureGraceMinutes:
+            (json['tripClosureGraceMinutes'] as num?)?.toInt() ?? 10,
+      );
 }
 
 class DeliveryTrip {
@@ -3513,26 +3681,26 @@ class DeliveryTrip {
   }
 
   Map<String, dynamic> toJson() => {
-    'id': id,
-    'startedAt': startedAt.toIso8601String(),
-    'endedAt': endedAt?.toIso8601String(),
-    'eligibleForClosureAt': eligibleForClosureAt?.toIso8601String(),
-    'orders': orders.map((order) => order.toJson()).toList(),
-  };
+        'id': id,
+        'startedAt': startedAt.toIso8601String(),
+        'endedAt': endedAt?.toIso8601String(),
+        'eligibleForClosureAt': eligibleForClosureAt?.toIso8601String(),
+        'orders': orders.map((order) => order.toJson()).toList(),
+      };
 
   static DeliveryTrip fromJson(Map<String, dynamic> json) => DeliveryTrip(
-    id: json['id'] as String,
-    startedAt: DateTime.parse(json['startedAt'] as String),
-    endedAt: json['endedAt'] == null
-        ? null
-        : DateTime.parse(json['endedAt'] as String),
-    eligibleForClosureAt: json['eligibleForClosureAt'] == null
-        ? null
-        : DateTime.parse(json['eligibleForClosureAt'] as String),
-    orders: (json['orders'] as List? ?? [])
-        .map((o) => DeliveryOrder.fromJson(o as Map<String, dynamic>))
-        .toList(),
-  );
+        id: json['id'] as String,
+        startedAt: DateTime.parse(json['startedAt'] as String),
+        endedAt: json['endedAt'] == null
+            ? null
+            : DateTime.parse(json['endedAt'] as String),
+        eligibleForClosureAt: json['eligibleForClosureAt'] == null
+            ? null
+            : DateTime.parse(json['eligibleForClosureAt'] as String),
+        orders: (json['orders'] as List? ?? [])
+            .map((o) => DeliveryOrder.fromJson(o as Map<String, dynamic>))
+            .toList(),
+      );
 }
 
 class DeliveryOrder {
@@ -3553,41 +3721,40 @@ class DeliveryOrder {
   DateTime? cancelledAt;
 
   Map<String, dynamic> toJson() => {
-    'id': id,
-    'acceptedAt': acceptedAt.toIso8601String(),
-    'status': status.name,
-    'pickedUpAt': pickedUpAt?.toIso8601String(),
-    'deliveredAt': deliveredAt?.toIso8601String(),
-    'cancelledAt': cancelledAt?.toIso8601String(),
-  };
+        'id': id,
+        'acceptedAt': acceptedAt.toIso8601String(),
+        'status': status.name,
+        'pickedUpAt': pickedUpAt?.toIso8601String(),
+        'deliveredAt': deliveredAt?.toIso8601String(),
+        'cancelledAt': cancelledAt?.toIso8601String(),
+      };
 
   static DeliveryOrder fromJson(Map<String, dynamic> json) => DeliveryOrder(
-    id: json['id'] as String,
-    acceptedAt: DateTime.parse(json['acceptedAt'] as String),
-    status:
-        DeliveryOrderStatusX.fromName(json['status'] as String?) ??
-        DeliveryOrderStatus.accepted,
-    pickedUpAt: json['pickedUpAt'] == null
-        ? null
-        : DateTime.parse(json['pickedUpAt'] as String),
-    deliveredAt: json['deliveredAt'] == null
-        ? null
-        : DateTime.parse(json['deliveredAt'] as String),
-    cancelledAt: json['cancelledAt'] == null
-        ? null
-        : DateTime.parse(json['cancelledAt'] as String),
-  );
+        id: json['id'] as String,
+        acceptedAt: DateTime.parse(json['acceptedAt'] as String),
+        status: DeliveryOrderStatusX.fromName(json['status'] as String?) ??
+            DeliveryOrderStatus.accepted,
+        pickedUpAt: json['pickedUpAt'] == null
+            ? null
+            : DateTime.parse(json['pickedUpAt'] as String),
+        deliveredAt: json['deliveredAt'] == null
+            ? null
+            : DateTime.parse(json['deliveredAt'] as String),
+        cancelledAt: json['cancelledAt'] == null
+            ? null
+            : DateTime.parse(json['cancelledAt'] as String),
+      );
 }
 
 enum DeliveryOrderStatus { accepted, pickedUp, delivered, cancelled }
 
 extension DeliveryOrderStatusX on DeliveryOrderStatus {
   String get label => switch (this) {
-    DeliveryOrderStatus.accepted => 'Accepted',
-    DeliveryOrderStatus.pickedUp => 'Picked up',
-    DeliveryOrderStatus.delivered => 'Delivered',
-    DeliveryOrderStatus.cancelled => 'Cancelled',
-  };
+        DeliveryOrderStatus.accepted => 'Accepted',
+        DeliveryOrderStatus.pickedUp => 'Picked up',
+        DeliveryOrderStatus.delivered => 'Delivered',
+        DeliveryOrderStatus.cancelled => 'Cancelled',
+      };
 
   static DeliveryOrderStatus? fromName(String? name) {
     if (name == null) return null;
@@ -3605,14 +3772,13 @@ class DeliveryLifecycleEvent {
   final DateTime timestamp;
 
   Map<String, dynamic> toJson() => {
-    'stage': stage.name,
-    'timestamp': timestamp.toIso8601String(),
-  };
+        'stage': stage.name,
+        'timestamp': timestamp.toIso8601String(),
+      };
 
   static DeliveryLifecycleEvent fromJson(Map<String, dynamic> json) =>
       DeliveryLifecycleEvent(
-        stage:
-            DeliveryLifecycleStageX.fromName(json['stage'] as String?) ??
+        stage: DeliveryLifecycleStageX.fromName(json['stage'] as String?) ??
             DeliveryLifecycleStage.waitingForOrder,
         timestamp: DateTime.parse(json['timestamp'] as String),
       );
@@ -3637,57 +3803,64 @@ enum DeliveryLifecycleStage {
 
 extension DeliveryLifecycleStageX on DeliveryLifecycleStage {
   String get label => switch (this) {
-    DeliveryLifecycleStage.shiftStarted => 'Shift started',
-    DeliveryLifecycleStage.shiftPaused => 'Shift paused',
-    DeliveryLifecycleStage.shiftEnded => 'Shift ended',
-    DeliveryLifecycleStage.waitingForOrder => 'Waiting for order',
-    DeliveryLifecycleStage.orderAccepted => 'Order accepted',
-    DeliveryLifecycleStage.travelingToRestaurant => 'Traveling to restaurant',
-    DeliveryLifecycleStage.atRestaurant => 'At restaurant',
-    DeliveryLifecycleStage.orderPickedUp => 'Order picked up',
-    DeliveryLifecycleStage.travelingToCustomer => 'Traveling to customer',
-    DeliveryLifecycleStage.delivered => 'Delivered',
-    DeliveryLifecycleStage.multipleOrdersActive => 'Multiple orders',
-    DeliveryLifecycleStage.delayedAtRestaurant => 'Delayed at restaurant',
-    DeliveryLifecycleStage.customerUnavailable => 'Customer unavailable',
-    DeliveryLifecycleStage.orderCancelled => 'Order cancelled',
-  };
+        DeliveryLifecycleStage.shiftStarted => 'Shift started',
+        DeliveryLifecycleStage.shiftPaused => 'Shift paused',
+        DeliveryLifecycleStage.shiftEnded => 'Shift ended',
+        DeliveryLifecycleStage.waitingForOrder => 'Waiting for order',
+        DeliveryLifecycleStage.orderAccepted => 'Order accepted',
+        DeliveryLifecycleStage.travelingToRestaurant =>
+          'Traveling to restaurant',
+        DeliveryLifecycleStage.atRestaurant => 'At restaurant',
+        DeliveryLifecycleStage.orderPickedUp => 'Order picked up',
+        DeliveryLifecycleStage.travelingToCustomer => 'Traveling to customer',
+        DeliveryLifecycleStage.delivered => 'Delivered',
+        DeliveryLifecycleStage.multipleOrdersActive => 'Multiple orders',
+        DeliveryLifecycleStage.delayedAtRestaurant => 'Delayed at restaurant',
+        DeliveryLifecycleStage.customerUnavailable => 'Customer unavailable',
+        DeliveryLifecycleStage.orderCancelled => 'Order cancelled',
+      };
 
   String get statusText => switch (this) {
-    DeliveryLifecycleStage.shiftStarted => 'Shift started',
-    DeliveryLifecycleStage.shiftPaused => 'Shift paused',
-    DeliveryLifecycleStage.shiftEnded => 'Shift ended',
-    DeliveryLifecycleStage.waitingForOrder => 'Waiting for order',
-    DeliveryLifecycleStage.orderAccepted => 'Order accepted',
-    DeliveryLifecycleStage.travelingToRestaurant => 'Traveling to restaurant',
-    DeliveryLifecycleStage.atRestaurant => 'At restaurant - waiting for pickup',
-    DeliveryLifecycleStage.orderPickedUp => 'Picked up - heading to customer',
-    DeliveryLifecycleStage.travelingToCustomer => 'Traveling to customer',
-    DeliveryLifecycleStage.delivered => 'Delivered',
-    DeliveryLifecycleStage.multipleOrdersActive => 'Multiple orders active',
-    DeliveryLifecycleStage.delayedAtRestaurant => 'Delayed at restaurant',
-    DeliveryLifecycleStage.customerUnavailable => 'Customer unavailable',
-    DeliveryLifecycleStage.orderCancelled => 'Order cancelled',
-  };
+        DeliveryLifecycleStage.shiftStarted => 'Shift started',
+        DeliveryLifecycleStage.shiftPaused => 'Shift paused',
+        DeliveryLifecycleStage.shiftEnded => 'Shift ended',
+        DeliveryLifecycleStage.waitingForOrder => 'Waiting for order',
+        DeliveryLifecycleStage.orderAccepted => 'Order accepted',
+        DeliveryLifecycleStage.travelingToRestaurant =>
+          'Traveling to restaurant',
+        DeliveryLifecycleStage.atRestaurant =>
+          'At restaurant - waiting for pickup',
+        DeliveryLifecycleStage.orderPickedUp =>
+          'Picked up - heading to customer',
+        DeliveryLifecycleStage.travelingToCustomer => 'Traveling to customer',
+        DeliveryLifecycleStage.delivered => 'Delivered',
+        DeliveryLifecycleStage.multipleOrdersActive => 'Multiple orders active',
+        DeliveryLifecycleStage.delayedAtRestaurant => 'Delayed at restaurant',
+        DeliveryLifecycleStage.customerUnavailable => 'Customer unavailable',
+        DeliveryLifecycleStage.orderCancelled => 'Order cancelled',
+      };
 
   IconData get icon => switch (this) {
-    DeliveryLifecycleStage.shiftStarted => Icons.play_arrow_rounded,
-    DeliveryLifecycleStage.shiftPaused => Icons.pause_rounded,
-    DeliveryLifecycleStage.shiftEnded => Icons.stop_rounded,
-    DeliveryLifecycleStage.waitingForOrder => Icons.hourglass_bottom_rounded,
-    DeliveryLifecycleStage.orderAccepted => Icons.check_circle_outline_rounded,
-    DeliveryLifecycleStage.travelingToRestaurant =>
-      Icons.directions_bike_rounded,
-    DeliveryLifecycleStage.atRestaurant => Icons.restaurant_rounded,
-    DeliveryLifecycleStage.orderPickedUp => Icons.shopping_bag_rounded,
-    DeliveryLifecycleStage.travelingToCustomer => Icons.delivery_dining_rounded,
-    DeliveryLifecycleStage.delivered => Icons.task_alt_rounded,
-    DeliveryLifecycleStage.multipleOrdersActive =>
-      Icons.library_add_check_rounded,
-    DeliveryLifecycleStage.delayedAtRestaurant => Icons.schedule_rounded,
-    DeliveryLifecycleStage.customerUnavailable => Icons.person_off_rounded,
-    DeliveryLifecycleStage.orderCancelled => Icons.cancel_rounded,
-  };
+        DeliveryLifecycleStage.shiftStarted => Icons.play_arrow_rounded,
+        DeliveryLifecycleStage.shiftPaused => Icons.pause_rounded,
+        DeliveryLifecycleStage.shiftEnded => Icons.stop_rounded,
+        DeliveryLifecycleStage.waitingForOrder =>
+          Icons.hourglass_bottom_rounded,
+        DeliveryLifecycleStage.orderAccepted =>
+          Icons.check_circle_outline_rounded,
+        DeliveryLifecycleStage.travelingToRestaurant =>
+          Icons.directions_bike_rounded,
+        DeliveryLifecycleStage.atRestaurant => Icons.restaurant_rounded,
+        DeliveryLifecycleStage.orderPickedUp => Icons.shopping_bag_rounded,
+        DeliveryLifecycleStage.travelingToCustomer =>
+          Icons.delivery_dining_rounded,
+        DeliveryLifecycleStage.delivered => Icons.task_alt_rounded,
+        DeliveryLifecycleStage.multipleOrdersActive =>
+          Icons.library_add_check_rounded,
+        DeliveryLifecycleStage.delayedAtRestaurant => Icons.schedule_rounded,
+        DeliveryLifecycleStage.customerUnavailable => Icons.person_off_rounded,
+        DeliveryLifecycleStage.orderCancelled => Icons.cancel_rounded,
+      };
 
   static DeliveryLifecycleStage? fromName(String? name) {
     if (name == null) return null;
@@ -3723,9 +3896,8 @@ class RouteSegment {
   double get netEarnings => (earnings ?? 0) * (1 - platform.deductionRate);
 
   String get tripSummary {
-    final restaurant = pickupRestaurantName.isEmpty
-        ? 'No restaurant'
-        : pickupRestaurantName;
+    final restaurant =
+        pickupRestaurantName.isEmpty ? 'No restaurant' : pickupRestaurantName;
     return '$restaurant - ${platform.label} - ${formatMoney(earnings ?? 0)} gross';
   }
 
@@ -3738,47 +3910,47 @@ class RouteSegment {
   }
 
   Map<String, dynamic> toJson() => {
-    'startedAt': startedAt.toIso8601String(),
-    'endedAt': endedAt?.toIso8601String(),
-    'pickupRestaurantName': pickupRestaurantName,
-    'platform': platform.name,
-    'earnings': earnings,
-    'reviewed': reviewed,
-    'points': points.map((p) => p.toJson()).toList(),
-  };
+        'startedAt': startedAt.toIso8601String(),
+        'endedAt': endedAt?.toIso8601String(),
+        'pickupRestaurantName': pickupRestaurantName,
+        'platform': platform.name,
+        'earnings': earnings,
+        'reviewed': reviewed,
+        'points': points.map((p) => p.toJson()).toList(),
+      };
 
   static RouteSegment fromJson(Map<String, dynamic> json) => RouteSegment(
-    startedAt: DateTime.parse(json['startedAt'] as String),
-    endedAt: json['endedAt'] == null
-        ? null
-        : DateTime.parse(json['endedAt'] as String),
-    pickupRestaurantName: json['pickupRestaurantName'] as String? ?? '',
-    platform: DeliveryPlatformX.fromName(json['platform'] as String?),
-    earnings: (json['earnings'] as num?)?.toDouble(),
-    reviewed: json['reviewed'] as bool? ?? false,
-    points: (json['points'] as List? ?? [])
-        .map((p) => TrackPoint.fromJson(p as Map<String, dynamic>))
-        .toList(),
-  );
+        startedAt: DateTime.parse(json['startedAt'] as String),
+        endedAt: json['endedAt'] == null
+            ? null
+            : DateTime.parse(json['endedAt'] as String),
+        pickupRestaurantName: json['pickupRestaurantName'] as String? ?? '',
+        platform: DeliveryPlatformX.fromName(json['platform'] as String?),
+        earnings: (json['earnings'] as num?)?.toDouble(),
+        reviewed: json['reviewed'] as bool? ?? false,
+        points: (json['points'] as List? ?? [])
+            .map((p) => TrackPoint.fromJson(p as Map<String, dynamic>))
+            .toList(),
+      );
 }
 
 enum DeliveryPlatform { wolt, uberEats }
 
 extension DeliveryPlatformX on DeliveryPlatform {
   String get label => switch (this) {
-    DeliveryPlatform.wolt => 'Wolt',
-    DeliveryPlatform.uberEats => 'Uber Eats',
-  };
+        DeliveryPlatform.wolt => 'Wolt',
+        DeliveryPlatform.uberEats => 'Uber Eats',
+      };
 
   double get deductionRate => switch (this) {
-    DeliveryPlatform.wolt => 0,
-    DeliveryPlatform.uberEats => 0.255,
-  };
+        DeliveryPlatform.wolt => 0,
+        DeliveryPlatform.uberEats => 0.255,
+      };
 
   IconData get icon => switch (this) {
-    DeliveryPlatform.wolt => Icons.delivery_dining_rounded,
-    DeliveryPlatform.uberEats => Icons.two_wheeler_rounded,
-  };
+        DeliveryPlatform.wolt => Icons.delivery_dining_rounded,
+        DeliveryPlatform.uberEats => Icons.two_wheeler_rounded,
+      };
 
   static DeliveryPlatform fromName(String? name) {
     return DeliveryPlatform.values.firstWhere(
@@ -3825,64 +3997,64 @@ class StopEvent {
   }
 
   Map<String, dynamic> toJson() => {
-    'latitude': latitude,
-    'longitude': longitude,
-    'startedAt': startedAt.toIso8601String(),
-    'endedAt': endedAt.toIso8601String(),
-    'restaurantName': restaurantName,
-    'placeName': placeName,
-    'note': note,
-    'type': type.name,
-    'reviewed': reviewed,
-  };
+        'latitude': latitude,
+        'longitude': longitude,
+        'startedAt': startedAt.toIso8601String(),
+        'endedAt': endedAt.toIso8601String(),
+        'restaurantName': restaurantName,
+        'placeName': placeName,
+        'note': note,
+        'type': type.name,
+        'reviewed': reviewed,
+      };
 
   static StopEvent fromJson(Map<String, dynamic> json) => StopEvent(
-    latitude: (json['latitude'] as num).toDouble(),
-    longitude: (json['longitude'] as num).toDouble(),
-    startedAt: DateTime.parse(json['startedAt'] as String),
-    endedAt: DateTime.parse(json['endedAt'] as String),
-    restaurantName: json['restaurantName'] as String? ?? '',
-    placeName: json['placeName'] as String? ?? '',
-    note: json['note'] as String? ?? '',
-    type: StopTypeX.fromName(json['type'] as String?) ?? StopType.other,
-    reviewed: json['reviewed'] as bool? ?? false,
-  );
+        latitude: (json['latitude'] as num).toDouble(),
+        longitude: (json['longitude'] as num).toDouble(),
+        startedAt: DateTime.parse(json['startedAt'] as String),
+        endedAt: DateTime.parse(json['endedAt'] as String),
+        restaurantName: json['restaurantName'] as String? ?? '',
+        placeName: json['placeName'] as String? ?? '',
+        note: json['note'] as String? ?? '',
+        type: StopTypeX.fromName(json['type'] as String?) ?? StopType.other,
+        reviewed: json['reviewed'] as bool? ?? false,
+      );
 }
 
 enum StopType { restaurant, customer, breakTime, waitingForOrder, other }
 
 extension StopTypeX on StopType {
   String get label => switch (this) {
-    StopType.restaurant => 'Restaurant',
-    StopType.customer => 'Customer',
-    StopType.breakTime => 'Break',
-    StopType.waitingForOrder => 'Waiting for order',
-    StopType.other => 'Other',
-  };
+        StopType.restaurant => 'Restaurant',
+        StopType.customer => 'Customer',
+        StopType.breakTime => 'Break',
+        StopType.waitingForOrder => 'Waiting for order',
+        StopType.other => 'Other',
+      };
 
   IconData get icon => switch (this) {
-    StopType.restaurant => Icons.restaurant_rounded,
-    StopType.customer => Icons.person_pin_circle_rounded,
-    StopType.breakTime => Icons.free_breakfast_rounded,
-    StopType.waitingForOrder => Icons.hourglass_bottom_rounded,
-    StopType.other => Icons.more_horiz_rounded,
-  };
+        StopType.restaurant => Icons.restaurant_rounded,
+        StopType.customer => Icons.person_pin_circle_rounded,
+        StopType.breakTime => Icons.free_breakfast_rounded,
+        StopType.waitingForOrder => Icons.hourglass_bottom_rounded,
+        StopType.other => Icons.more_horiz_rounded,
+      };
 
   IconData get mapIcon => switch (this) {
-    StopType.restaurant => Icons.restaurant_rounded,
-    StopType.customer => Icons.location_on_rounded,
-    StopType.breakTime => Icons.pause_circle_filled_rounded,
-    StopType.waitingForOrder => Icons.hourglass_bottom_rounded,
-    StopType.other => Icons.pause_circle_filled_rounded,
-  };
+        StopType.restaurant => Icons.restaurant_rounded,
+        StopType.customer => Icons.location_on_rounded,
+        StopType.breakTime => Icons.pause_circle_filled_rounded,
+        StopType.waitingForOrder => Icons.hourglass_bottom_rounded,
+        StopType.other => Icons.pause_circle_filled_rounded,
+      };
 
   Color get mapColor => switch (this) {
-    StopType.restaurant => const Color(0xff2563eb),
-    StopType.customer => const Color(0xff7c3aed),
-    StopType.breakTime => const Color(0xfff59e0b),
-    StopType.waitingForOrder => const Color(0xffeab308),
-    StopType.other => const Color(0xff6366f1),
-  };
+        StopType.restaurant => const Color(0xff2563eb),
+        StopType.customer => const Color(0xff7c3aed),
+        StopType.breakTime => const Color(0xfff59e0b),
+        StopType.waitingForOrder => const Color(0xffeab308),
+        StopType.other => const Color(0xff6366f1),
+      };
 
   static StopType? fromName(String? name) {
     if (name == null) return null;
@@ -3909,20 +4081,20 @@ class TrackPoint {
   final double speedMetersPerSecond;
 
   Map<String, dynamic> toJson() => {
-    'latitude': latitude,
-    'longitude': longitude,
-    'timestamp': timestamp.toIso8601String(),
-    'accuracy': accuracy,
-    'speedMetersPerSecond': speedMetersPerSecond,
-  };
+        'latitude': latitude,
+        'longitude': longitude,
+        'timestamp': timestamp.toIso8601String(),
+        'accuracy': accuracy,
+        'speedMetersPerSecond': speedMetersPerSecond,
+      };
 
   static TrackPoint fromJson(Map<String, dynamic> json) => TrackPoint(
-    latitude: (json['latitude'] as num).toDouble(),
-    longitude: (json['longitude'] as num).toDouble(),
-    timestamp: DateTime.parse(json['timestamp'] as String),
-    accuracy: (json['accuracy'] as num).toDouble(),
-    speedMetersPerSecond: (json['speedMetersPerSecond'] as num).toDouble(),
-  );
+        latitude: (json['latitude'] as num).toDouble(),
+        longitude: (json['longitude'] as num).toDouble(),
+        timestamp: DateTime.parse(json['timestamp'] as String),
+        accuracy: (json['accuracy'] as num).toDouble(),
+        speedMetersPerSecond: (json['speedMetersPerSecond'] as num).toDouble(),
+      );
 }
 
 class StopDraft {
@@ -4053,8 +4225,7 @@ double haversineMeters(TrackPoint a, TrackPoint b) {
   final lat2 = b.latitude * pi / 180;
   final dLat = (b.latitude - a.latitude) * pi / 180;
   final dLng = (b.longitude - a.longitude) * pi / 180;
-  final h =
-      sin(dLat / 2) * sin(dLat / 2) +
+  final h = sin(dLat / 2) * sin(dLat / 2) +
       cos(lat1) * cos(lat2) * sin(dLng / 2) * sin(dLng / 2);
   return earthRadius * 2 * atan2(sqrt(h), sqrt(1 - h));
 }
