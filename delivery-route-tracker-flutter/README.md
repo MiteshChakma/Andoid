@@ -47,16 +47,217 @@ Core tracking model:
 ```mermaid
 flowchart LR
   A["Start shift"] --> B["Record GPS points"]
-  B --> C{"Moved outside 300 m wait zone?"}
-  C -- "Yes" --> D["Create/continue trip segment"]
-  C -- "No, stopped over 60 sec" --> E["Create stop/wait event"]
-  E --> F["Classify stop"]
-  F --> B
-  D --> G["Lifecycle buttons: accepted, restaurant, picked up, delivered"]
-  G --> B
-  B --> H["Stop shift"]
-  H --> I["Save local history, reports, exports"]
+  B --> C["Waiting for order"]
+  C --> D["Order accepted"]
+  D --> E["Traveling to restaurant"]
+  E --> F["At restaurant"]
+  F --> G["Order picked up"]
+  G --> H["Traveling to customer"]
+  H --> I["Delivered"]
+  I --> J{"All active orders delivered?"}
+  J -- "No" --> H
+  J -- "Yes" --> K["Waiting for order grace period"]
+  K --> L{"New order accepted?"}
+  L -- "Yes" --> D
+  L -- "No, grace passed" --> M["Trip eligible to close"]
+  B --> N["Stop shift manually"]
+  N --> O["Save local history, reports, exports"]
 ```
+
+## Final Requirements Update
+
+The latest update is focused on real-world delivery operations. Existing features should remain unchanged unless they are directly related to shift continuity, lifecycle tracking, multi-order delivery handling, journey segmentation, route visualization, or historical data preservation.
+
+### Shift Continuity
+
+The app should not treat application state as delivery state. A shift or trip should not be ended just because:
+
+- The app was closed.
+- The app crashed.
+- The app was sent to the background.
+- GPS was temporarily unavailable.
+- Internet connectivity was lost.
+- The device restarted.
+
+Only intentional user actions should end a shift. The Stop button is the intentional end-shift action.
+
+Implemented in the current codebase:
+
+- Active shift ID is stored locally.
+- Active shifts are autosaved while tracking.
+- The app attempts to recover an active shift when reopened.
+- Recovery uses a configurable grace period.
+- Android back/close navigation shows a warning while a shift is active.
+
+### Recovery Grace Period
+
+The recovery grace period controls how long an accidentally closed active shift remains recoverable.
+
+Available settings:
+
+- 30 minutes
+- 1 hour
+- 2 hours
+- 4 hours
+
+If the app is reopened inside the grace period, the previous active shift can resume from saved local state. This protects against accidental closure and temporary interruption.
+
+### Expanded Delivery Lifecycle
+
+The delivery lifecycle card now represents a fuller delivery workflow.
+
+Shift-level states:
+
+- Shift started
+- Shift paused
+- Shift ended
+
+Order and journey states:
+
+- Waiting for order
+- Order accepted
+- Traveling to restaurant
+- At restaurant
+- Order picked up
+- Traveling to customer
+- Delivered
+
+Exception and optional states:
+
+- Multiple orders active
+- Delayed at restaurant
+- Customer unavailable
+- Order cancelled
+
+The lifecycle card displays:
+
+- Current status
+- Active order count
+- Current trip ID
+- Trip start time
+- Active duration
+- Distance travelled
+- Recent status history
+
+### Standard Delivery Workflow
+
+A normal single-order delivery should follow:
+
+1. Shift started
+2. Waiting for order
+3. Order accepted
+4. Traveling to restaurant
+5. At restaurant
+6. Order picked up
+7. Traveling to customer
+8. Delivered
+9. Waiting for order
+
+The cycle repeats when a new order arrives.
+
+### Trip And Order Model
+
+The updated model separates a shift, a trip, and an order.
+
+| Concept | Meaning |
+| --- | --- |
+| Shift | The full working session from Start Shift to Stop Shift. |
+| Trip | A delivery work cycle that begins when the first order is accepted and continues until all related orders are delivered and the waiting grace period passes. |
+| Order | One individual delivery inside a trip. A trip can contain one or many orders. |
+
+New data is stored alongside the older route/segment model. This keeps existing saved history compatible while allowing new trips to use the richer order model.
+
+### Multiple Order Support
+
+The app supports stacked delivery scenarios where another order arrives before the current delivery is complete.
+
+Example:
+
+1. Order A accepted.
+2. Driver travels to Restaurant A.
+3. Order A picked up.
+4. Order B accepted before Order A is delivered.
+5. Driver travels to Restaurant B.
+6. Order B picked up.
+7. Order A delivered.
+8. Order B delivered.
+9. Driver returns to Waiting for order.
+
+All of this remains inside the same active trip. A new trip is not created just because another order is accepted during an active route.
+
+### Trip Completion Rule
+
+A trip is not complete until every active order in that trip is delivered or cancelled.
+
+Business rule:
+
+```text
+Active Orders = Picked Up Orders - Delivered Orders
+```
+
+If active orders are greater than zero:
+
+- The trip remains active.
+
+If active orders are zero:
+
+- The trip becomes eligible for closure only after the driver returns to Waiting for order and the trip closure grace period passes.
+
+This prevents a trip from ending too early when a driver is still carrying food or still returning to a waiting area.
+
+### Waiting Period And Grace Zone
+
+After a delivery is completed, the driver may travel to a hotspot, city center, restaurant area, or preferred waiting location. That movement is still useful delivery-work movement.
+
+Current behavior goal:
+
+1. User marks an order as Delivered.
+2. User selects Waiting for order.
+3. User moves toward a waiting location.
+4. The route is still tracked as part of the current trip during the grace period.
+5. If a new order is accepted during that waiting period, the same trip continues.
+6. If no order arrives and the grace period passes, the trip becomes eligible for closure.
+
+### Route And Stop Detection
+
+The app still keeps the earlier GPS segmentation behavior:
+
+- Stop/wait zone radius: 300 meters.
+- Stop detection delay: 60 seconds.
+- GPS points are filtered for weak accuracy, speed spikes, and obvious jumps.
+- Stops can be classified as restaurant, customer, break, waiting for order, or other.
+
+### Map Visualization Requirements
+
+The latest requirements call for easier route inspection and clearer map visuals.
+
+Implemented:
+
+- More visible trip start and current/end markers.
+- Stop marker colors/icons by stop type.
+- Active map controls for zoom in, zoom out, recenter, and fullscreen route inspection.
+- Existing pan, drag, pinch zoom, and double-tap zoom support.
+- Timeline playback with point details.
+
+Planned:
+
+- Status-based route coloring, such as gray for waiting, blue for traveling to restaurant, orange for traveling to customer, and green for active delivery.
+- Full route summary overlay on the map.
+- Fit entire trip to screen control.
+- More advanced route smoothing.
+
+### Backward Compatibility
+
+Historical data preservation is a requirement.
+
+Current strategy:
+
+- Existing shifts, routes, stops, and earnings remain in the legacy structure.
+- New fields are optional when reading JSON.
+- Missing fields receive safe defaults.
+- No automatic conversion of old history is performed in this release.
+
+Future migration may convert older route segments into the new trip/order model, but that should be a separate migration task so old records are not corrupted.
 
 ## Current Features
 
