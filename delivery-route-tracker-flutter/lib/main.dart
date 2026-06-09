@@ -157,17 +157,25 @@ class _TrackerPageState extends State<TrackerPage> {
     final shifts = await _store.load();
     final activeId = prefs.getString(_activeShiftKey);
     final graceMinutes = prefs.getInt(_shiftRecoveryGraceMinutesKey) ?? 120;
-    Shift? recoveredShift;
+    var recoveredShift = await _store.loadActive();
     if (activeId != null) {
-      for (final shift in shifts) {
-        final recoverable = shift.id == activeId &&
-            shift.endedAt == null &&
-            DateTime.now().difference(shift.lastActivityAt) <=
-                Duration(minutes: graceMinutes);
-        if (recoverable) {
-          recoveredShift = shift;
-          break;
+      if (recoveredShift == null || recoveredShift.id != activeId) {
+        for (final shift in shifts) {
+          final recoverable = shift.id == activeId &&
+              shift.endedAt == null &&
+              DateTime.now().difference(shift.lastActivityAt) <=
+                  Duration(minutes: graceMinutes);
+          if (recoverable) {
+            recoveredShift = shift;
+            break;
+          }
         }
+      }
+      if (recoveredShift != null &&
+          (recoveredShift.endedAt != null ||
+              DateTime.now().difference(recoveredShift.lastActivityAt) >
+                  Duration(minutes: graceMinutes))) {
+        recoveredShift = null;
       }
     }
     if (!mounted) return;
@@ -296,35 +304,33 @@ class _TrackerPageState extends State<TrackerPage> {
   Future<void> _markShiftActive(Shift shift) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_activeShiftKey, shift.id);
+    await _store.saveActive(shift);
   }
 
   Future<void> _clearActiveShiftMarker() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_activeShiftKey);
+    await _store.clearActive();
   }
 
   Future<bool> _confirmLeaveDuringShift() async {
     if (!_isTracking || !mounted) return true;
-    final leave = await showDialog<bool>(
+    await showDialog<void>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Shift still active'),
+        title: const Text('Shift is still active'),
         content: Text(
-          'Tracking will keep running and can be recovered for $_shiftRecoveryGraceMinutes minutes. Use Stop only when you really want to end the shift.',
+          'Back is locked while tracking so accidental presses do not close the app. Use the phone Home button to background the app, or End shift when you are finished. Recovery is kept for $_shiftRecoveryGraceMinutes minutes.',
         ),
         actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Stay'),
-          ),
           FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Leave app'),
+            onPressed: () => Navigator.pop(context),
+            child: const Text('OK'),
           ),
         ],
       ),
     );
-    return leave == true;
+    return false;
   }
 
   LocationSettings _locationSettings() {
@@ -512,7 +518,8 @@ class _TrackerPageState extends State<TrackerPage> {
       return;
     }
     _lastAutoSaveAt = now;
-    await _store.save(shift);
+    shift.lastActivityAt = now;
+    await _store.saveActive(shift);
   }
 
   void _closeEligibleDeliveryTrips(Shift shift, DateTime now) {
@@ -1372,7 +1379,8 @@ class _TrackerPageState extends State<TrackerPage> {
     _positionSub = null;
 
     try {
-      await _store.save(shift).timeout(const Duration(seconds: 10));
+      await _store.saveActive(shift).timeout(const Duration(seconds: 8));
+      await _store.save(shift).timeout(const Duration(seconds: 30));
       await _clearActiveShiftMarker().timeout(const Duration(seconds: 3));
       if (_notificationsReady) {
         await _notifications
@@ -1383,9 +1391,10 @@ class _TrackerPageState extends State<TrackerPage> {
       if (!mounted) return;
       setState(() {
         _activeShift = shift;
-        _status = 'Could not save shift. Try Stop again.';
+        _status = 'Could not save shift. Recovery copy kept.';
       });
       _logDiagnostic('Shift save failed', error.toString());
+      _startRuntimeForRecoveredShift(shift);
       return;
     }
 
@@ -4185,11 +4194,29 @@ class PermissionSnapshot {
 
 class ShiftStore {
   static const _key = 'saved_shifts';
+  static const _historyFilename = 'delivery_shifts.json';
+  static const _activeFilename = 'active_shift.json';
+
+  Future<File> get _historyFile async {
+    final dir = await getApplicationDocumentsDirectory();
+    return File('${dir.path}${Platform.pathSeparator}$_historyFilename');
+  }
+
+  Future<File> get _activeFile async {
+    final dir = await getApplicationDocumentsDirectory();
+    return File('${dir.path}${Platform.pathSeparator}$_activeFilename');
+  }
 
   Future<List<Shift>> load() async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(_key);
-    if (raw == null || raw.isEmpty) return [];
+    final file = await _historyFile;
+    var raw = '';
+    if (await file.exists()) {
+      raw = await file.readAsString();
+    } else {
+      final prefs = await SharedPreferences.getInstance();
+      raw = prefs.getString(_key) ?? '';
+    }
+    if (raw.isEmpty) return [];
     try {
       final decoded = jsonDecode(raw) as List;
       final shifts = decoded
@@ -4203,31 +4230,50 @@ class ShiftStore {
   }
 
   Future<void> save(Shift shift) async {
-    final prefs = await SharedPreferences.getInstance();
     final shifts = await load();
     shifts.removeWhere((item) => item.id == shift.id);
     shifts.insert(0, shift);
-    await prefs.setString(
-      _key,
-      jsonEncode(shifts.map((item) => item.toJson()).toList()),
-    );
+    await _writeHistory(shifts);
   }
 
   Future<void> deleteShift(String id) async {
-    final prefs = await SharedPreferences.getInstance();
     final shifts = await load();
     shifts.removeWhere((item) => item.id == id);
-    await prefs.setString(
-      _key,
-      jsonEncode(shifts.map((item) => item.toJson()).toList()),
-    );
+    await _writeHistory(shifts);
   }
 
   Future<void> replaceAll(List<Shift> shifts) async {
-    final prefs = await SharedPreferences.getInstance();
     shifts.sort((a, b) => b.startedAt.compareTo(a.startedAt));
-    await prefs.setString(
-      _key,
+    await _writeHistory(shifts);
+  }
+
+  Future<void> saveActive(Shift shift) async {
+    final file = await _activeFile;
+    await file.writeAsString(jsonEncode(shift.toJson()));
+  }
+
+  Future<Shift?> loadActive() async {
+    try {
+      final file = await _activeFile;
+      if (!await file.exists()) return null;
+      final raw = await file.readAsString();
+      if (raw.trim().isEmpty) return null;
+      return Shift.fromJson(jsonDecode(raw) as Map<String, dynamic>);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> clearActive() async {
+    final file = await _activeFile;
+    if (await file.exists()) {
+      await file.delete();
+    }
+  }
+
+  Future<void> _writeHistory(List<Shift> shifts) async {
+    final file = await _historyFile;
+    await file.writeAsString(
       jsonEncode(shifts.map((item) => item.toJson()).toList()),
     );
   }
