@@ -312,6 +312,7 @@ These are feature milestones for this prototype. The package version in `pubspec
 | v0.9 | Shift continuity and multi-order model | Accidental-close recovery, configurable recovery grace period, expanded lifecycle statuses, order/trip data model, stacked delivery support, active order count, trip closure rules, improved map markers and controls. |
 | v0.10 | Idle and active performance analytics | Calendar Performance period switch for day/week/month, active-order time calculation, no-order waiting time, waiting-vs-active ratio, waiting distance, and active delivery distance. |
 | v0.11 | Stop shift reliability and UI organization | Guarded End Shift finalization, active recovery cleanup after save, shorter Calendar tab, and separate Reports tab for analytics, verification, playback, and exports. |
+| v0.12 | End Shift UI finalization | End Shift now saves the completed shift, clears the active marker, switches the tracker UI back to Start Shift immediately, and finishes recovery/notification cleanup in the background. |
 
 ## Working Process
 
