@@ -391,16 +391,35 @@ Exports are saved to the app documents folder on the Android device.
 
 ## Tech Stack
 
-- Flutter
-- Dart
-- Android
-- `geolocator` for GPS and foreground tracking
-- `flutter_map` for OpenStreetMap-based maps
-- `flutter_local_notifications` for tracking and action notifications
-- `permission_handler` for Android permission flows
-- `path_provider` for local export paths
-- `shared_preferences` for local persisted shift data and settings
-- OpenStreetMap tiles for map rendering
+| Layer | Technology | Use In This App |
+| --- | --- | --- |
+| App framework | Flutter | Android mobile UI, Material widgets, dark mode, tab navigation, forms, timeline screens, and route review screens. |
+| Language | Dart | App state, route segmentation, stop detection, earnings logic, analytics, import/export generation, and local data models. |
+| Target platform | Android | Primary supported platform for foreground/background delivery tracking. |
+| GPS/location | `geolocator` | Location permissions, current position, movement stream, speed/accuracy readings, and route point capture. |
+| Maps | `flutter_map`, `latlong2`, OpenStreetMap tiles | Live route preview, day map, playback map, route polylines, start/end markers, stop markers, and map interaction. |
+| Notifications | `flutter_local_notifications` | Ongoing tracking notification, trip status actions, stop classification actions, and Android notification setup. |
+| Permissions | `permission_handler` plus Android manifest permissions | Location, background location, notifications, overlay diagnostics, foreground service, wake lock, internet, and legacy external storage declarations. |
+| Local files | `path_provider`, `dart:io` | App documents folder storage for saved shift history, active shift recovery, CSV, JSON, GPX, and KML files. |
+| Local preferences | `shared_preferences` | Battery-safe mode, active shift marker, recovery grace setting, and compatibility fallback for older saved history. |
+| Date/time formatting | `intl` | Calendar labels, timeline timestamps, export filenames, and report periods. |
+| Analytics engine | In-app Dart models | Moving/waiting time, active delivery time, no-order waiting time, waiting-vs-active ratio, distance split, earnings/hour, earnings/km, and Wolt/Uber Eats totals. |
+| Export formats | CSV, JSON, GPX, KML | Spreadsheet analysis, backup/restore, and route viewing in mapping/GIS tools. |
+| Android build | Gradle wrapper, Android Gradle Plugin, Kotlin/Java toolchain | APK build, manifest merging, debug/release packaging, and Android app signing. |
+| QA tooling | `flutter_lints`, `flutter_test`, `dart analyze` | Static analysis, linting, and test scaffold for future route/tracking test coverage. |
+
+Android manifest permissions currently include:
+
+- `ACCESS_FINE_LOCATION`
+- `ACCESS_COARSE_LOCATION`
+- `ACCESS_BACKGROUND_LOCATION`
+- `FOREGROUND_SERVICE`
+- `FOREGROUND_SERVICE_LOCATION`
+- `POST_NOTIFICATIONS`
+- `WAKE_LOCK`
+- `INTERNET`
+- `SYSTEM_ALERT_WINDOW`
+- Legacy `READ_EXTERNAL_STORAGE` and `WRITE_EXTERNAL_STORAGE` with Android version limits
 
 ## Android Permissions
 
