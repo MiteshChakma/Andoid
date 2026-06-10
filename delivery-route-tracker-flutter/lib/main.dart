@@ -129,6 +129,7 @@ class _TrackerPageState extends State<TrackerPage> {
   bool _notificationsReady = false;
   bool _batterySafeMode = true;
   bool _locationStreamStoppedMode = false;
+  bool _isStoppingShift = false;
   String _lastGpsError = 'No GPS errors logged';
   int _shiftRecoveryGraceMinutes = 120;
   final List<DiagnosticEntry> _diagnostics = [];
@@ -158,7 +159,7 @@ class _TrackerPageState extends State<TrackerPage> {
     final shifts = await _store.load();
     final activeId = prefs.getString(_activeShiftKey);
     final graceMinutes = prefs.getInt(_shiftRecoveryGraceMinutesKey) ?? 120;
-    var recoveredShift = await _store.loadActive();
+    var recoveredShift = activeId == null ? null : await _store.loadActive();
     if (activeId != null) {
       if (recoveredShift == null || recoveredShift.id != activeId) {
         for (final shift in shifts) {
@@ -1366,12 +1367,13 @@ class _TrackerPageState extends State<TrackerPage> {
   }
 
   Future<void> _stopShift() async {
+    if (_isStoppingShift) return;
     final shift = _activeShift;
     if (shift == null) return;
 
     final endedAt = DateTime.now();
     setState(() {
-      _activeShift = null;
+      _isStoppingShift = true;
       _stopDraft = null;
       _lastAutoSaveAt = null;
       _status = 'Saving shift...';
@@ -1410,6 +1412,10 @@ class _TrackerPageState extends State<TrackerPage> {
       await _store.saveActive(shift).timeout(const Duration(seconds: 8));
       await _store.save(shift).timeout(const Duration(seconds: 30));
       await _clearActiveShiftMarker().timeout(const Duration(seconds: 3));
+      await _store.clearActive().timeout(
+            const Duration(seconds: 3),
+            onTimeout: () {},
+          );
       if (_notificationsReady) {
         await _notifications
             .cancel(_trackingNotificationId)
@@ -1419,6 +1425,7 @@ class _TrackerPageState extends State<TrackerPage> {
       if (!mounted) return;
       setState(() {
         _activeShift = shift;
+        _isStoppingShift = false;
         _status = 'Could not save shift. Recovery copy kept.';
       });
       _logDiagnostic('Shift save failed', error.toString());
@@ -1428,13 +1435,14 @@ class _TrackerPageState extends State<TrackerPage> {
 
     if (!mounted) return;
     setState(() {
+      _activeShift = null;
+      _isStoppingShift = false;
       _savedShifts.removeWhere((item) => item.id == shift.id);
       _savedShifts.insert(0, shift);
       _status = shift.segments.isEmpty
           ? 'Shift saved without movement'
           : 'Shift saved';
     });
-    unawaited(_loadHistory());
   }
 
   @override
@@ -1452,7 +1460,13 @@ class _TrackerPageState extends State<TrackerPage> {
       child: Scaffold(
         appBar: AppBar(
           title: Text(
-            ['Tracker', 'Calendar', 'Earnings', 'Settings'][_tabIndex],
+            [
+              'Tracker',
+              'Calendar',
+              'Reports',
+              'Earnings',
+              'Settings'
+            ][_tabIndex],
           ),
           surfaceTintColor: Colors.transparent,
         ),
@@ -1461,6 +1475,7 @@ class _TrackerPageState extends State<TrackerPage> {
           children: [
             _buildTrackerTab(shift),
             _buildCalendarTab(),
+            _buildReportsTab(),
             _buildEarningsTab(),
             _buildSettingsTab(),
           ],
@@ -1476,6 +1491,10 @@ class _TrackerPageState extends State<TrackerPage> {
             NavigationDestination(
               icon: Icon(Icons.calendar_month_rounded),
               label: 'Calendar',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.analytics_rounded),
+              label: 'Reports',
             ),
             NavigationDestination(
               icon: Icon(Icons.payments_rounded),
@@ -1500,6 +1519,7 @@ class _TrackerPageState extends State<TrackerPage> {
           shift: shift,
           now: _now,
           isTracking: _isTracking,
+          isStopping: _isStoppingShift,
           onStart: _startShift,
           onStop: _stopShift,
         ),
@@ -1547,16 +1567,9 @@ class _TrackerPageState extends State<TrackerPage> {
         _DayView(
           selectedDay: _selectedDay,
           shifts: _selectedDayShifts,
-          performanceShifts: _selectedPerformanceShifts,
-          performancePeriod: _performancePeriod,
-          performancePeriodStart: _performancePeriodStart,
-          performancePeriodEnd: _performancePeriodEnd,
           lastKnownPoint: _lastKnownPoint,
           onPreviousDay: () => _changeSelectedDay(-1),
           onNextDay: () => _changeSelectedDay(1),
-          onPerformancePeriodChanged: _changePerformancePeriod,
-          onCopyCsv: _copySelectedDayCsv,
-          onSaveCsv: _saveSelectedDayCsv,
           onPickDate: _pickCalendarDate,
           onEditStop: _editStopLabel,
           onEditTrip: _editTrip,
@@ -1577,6 +1590,68 @@ class _TrackerPageState extends State<TrackerPage> {
             (item) =>
                 _HistoryTile(shift: item, onDelete: () => _deleteShift(item)),
           ),
+      ],
+    );
+  }
+
+  Widget _buildReportsTab() {
+    final shifts = _selectedDayShifts;
+    final points = shifts.expand((shift) => shift.points).toList()
+      ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
+
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+      children: [
+        Row(
+          children: [
+            Text('Reports', style: Theme.of(context).textTheme.titleMedium),
+            const Spacer(),
+            IconButton(
+              tooltip: 'Previous day',
+              onPressed: () => _changeSelectedDay(-1),
+              icon: const Icon(Icons.chevron_left_rounded),
+            ),
+            TextButton.icon(
+              onPressed: _pickCalendarDate,
+              icon: const Icon(Icons.event_rounded),
+              label: Text(DateFormat('MMM d, yyyy').format(_selectedDay)),
+            ),
+            IconButton(
+              tooltip: 'Next day',
+              onPressed: () => _changeSelectedDay(1),
+              icon: const Icon(Icons.chevron_right_rounded),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        _PerformanceSummary(
+          shifts: _selectedPerformanceShifts,
+          period: _performancePeriod,
+          periodStart: _performancePeriodStart,
+          periodEnd: _performancePeriodEnd,
+          onPeriodChanged: _changePerformancePeriod,
+        ),
+        const SizedBox(height: 12),
+        _TimelinePlayback(shifts: shifts, lastKnownPoint: _lastKnownPoint),
+        const SizedBox(height: 12),
+        _RouteVerificationPanel(
+          shifts: shifts,
+          onEditTrip: _editTrip,
+          onEditStop: _editStopLabel,
+          onConfirmTrip: _confirmTrip,
+          onConfirmStop: _confirmStop,
+        ),
+        const SizedBox(height: 12),
+        _DayTimelineList(shifts: shifts, points: points),
+        const SizedBox(height: 12),
+        _ExportActionsPanel(
+          hasShifts: shifts.isNotEmpty,
+          onCopyCsv: _copySelectedDayCsv,
+          onSaveCsv: _saveSelectedDayCsv,
+          onSaveGpx: _saveSelectedDayGpx,
+          onSaveKml: _saveSelectedDayKml,
+          onExportJson: _exportJsonBackup,
+        ),
       ],
     );
   }
@@ -1992,6 +2067,7 @@ class _TrackerStatusHeader extends StatelessWidget {
     required this.shift,
     required this.now,
     required this.isTracking,
+    required this.isStopping,
     required this.onStart,
     required this.onStop,
   });
@@ -2000,6 +2076,7 @@ class _TrackerStatusHeader extends StatelessWidget {
   final Shift? shift;
   final DateTime now;
   final bool isTracking;
+  final bool isStopping;
   final VoidCallback onStart;
   final VoidCallback onStop;
 
@@ -2045,7 +2122,7 @@ class _TrackerStatusHeader extends StatelessWidget {
               children: [
                 Expanded(
                   child: FilledButton.icon(
-                    onPressed: isTracking ? null : onStart,
+                    onPressed: isTracking || isStopping ? null : onStart,
                     icon: const Icon(Icons.play_arrow_rounded),
                     label: const Text('Start shift'),
                   ),
@@ -2055,9 +2132,15 @@ class _TrackerStatusHeader extends StatelessWidget {
                   child: FilledButton.icon(
                     style: FilledButton.styleFrom(
                         backgroundColor: const Color(0xffdc2626)),
-                    onPressed: isTracking ? onStop : null,
-                    icon: const Icon(Icons.stop_rounded),
-                    label: const Text('End shift'),
+                    onPressed: isTracking && !isStopping ? onStop : null,
+                    icon: isStopping
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.stop_rounded),
+                    label: Text(isStopping ? 'Saving...' : 'End shift'),
                   ),
                 ),
               ],
@@ -2667,6 +2750,69 @@ class _RouteVerificationPanel extends StatelessWidget {
   }
 }
 
+class _ExportActionsPanel extends StatelessWidget {
+  const _ExportActionsPanel({
+    required this.hasShifts,
+    required this.onCopyCsv,
+    required this.onSaveCsv,
+    required this.onSaveGpx,
+    required this.onSaveKml,
+    required this.onExportJson,
+  });
+
+  final bool hasShifts;
+  final VoidCallback onCopyCsv;
+  final VoidCallback onSaveCsv;
+  final VoidCallback onSaveGpx;
+  final VoidCallback onSaveKml;
+  final VoidCallback onExportJson;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      child: ExpansionTile(
+        leading: const Icon(Icons.ios_share_rounded),
+        title: const Text('Export selected data'),
+        subtitle: const Text('CSV, GPX, KML, and full JSON backup'),
+        childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+        children: [
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              OutlinedButton.icon(
+                onPressed: hasShifts ? onCopyCsv : null,
+                icon: const Icon(Icons.copy_all_rounded),
+                label: const Text('Copy CSV'),
+              ),
+              OutlinedButton.icon(
+                onPressed: hasShifts ? onSaveCsv : null,
+                icon: const Icon(Icons.save_alt_rounded),
+                label: const Text('Save CSV'),
+              ),
+              OutlinedButton.icon(
+                onPressed: hasShifts ? onSaveGpx : null,
+                icon: const Icon(Icons.alt_route_rounded),
+                label: const Text('GPX'),
+              ),
+              OutlinedButton.icon(
+                onPressed: hasShifts ? onSaveKml : null,
+                icon: const Icon(Icons.travel_explore_rounded),
+                label: const Text('KML'),
+              ),
+              OutlinedButton.icon(
+                onPressed: onExportJson,
+                icon: const Icon(Icons.backup_rounded),
+                label: const Text('JSON backup'),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _TimelinePlayback extends StatefulWidget {
   const _TimelinePlayback({required this.shifts, required this.lastKnownPoint});
 
@@ -2868,16 +3014,9 @@ class _DayView extends StatelessWidget {
   const _DayView({
     required this.selectedDay,
     required this.shifts,
-    required this.performanceShifts,
-    required this.performancePeriod,
-    required this.performancePeriodStart,
-    required this.performancePeriodEnd,
     required this.lastKnownPoint,
     required this.onPreviousDay,
     required this.onNextDay,
-    required this.onPerformancePeriodChanged,
-    required this.onCopyCsv,
-    required this.onSaveCsv,
     required this.onPickDate,
     required this.onEditStop,
     required this.onEditTrip,
@@ -2888,16 +3027,9 @@ class _DayView extends StatelessWidget {
 
   final DateTime selectedDay;
   final List<Shift> shifts;
-  final List<Shift> performanceShifts;
-  final PerformancePeriod performancePeriod;
-  final DateTime performancePeriodStart;
-  final DateTime performancePeriodEnd;
   final TrackPoint? lastKnownPoint;
   final VoidCallback onPreviousDay;
   final VoidCallback onNextDay;
-  final ValueChanged<PerformancePeriod> onPerformancePeriodChanged;
-  final VoidCallback onCopyCsv;
-  final VoidCallback onSaveCsv;
   final VoidCallback onPickDate;
   final ValueChanged<StopEvent> onEditStop;
   final void Function(Shift shift, RouteSegment segment) onEditTrip;
@@ -2923,9 +3055,6 @@ class _DayView extends StatelessWidget {
       0,
       (sum, shift) => sum + shift.stops.length,
     );
-    final points = shifts.expand((shift) => shift.points).toList()
-      ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
-
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -2972,14 +3101,6 @@ class _DayView extends StatelessWidget {
           ],
         ),
         const SizedBox(height: 12),
-        _PerformanceSummary(
-          shifts: performanceShifts,
-          period: performancePeriod,
-          periodStart: performancePeriodStart,
-          periodEnd: performancePeriodEnd,
-          onPeriodChanged: onPerformancePeriodChanged,
-        ),
-        const SizedBox(height: 12),
         SizedBox(
           height: 320,
           child: DecoratedBox(
@@ -2994,41 +3115,6 @@ class _DayView extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 12),
-        _TimelinePlayback(shifts: shifts, lastKnownPoint: lastKnownPoint),
-        const SizedBox(height: 12),
-        _DayTimelineList(shifts: shifts, points: points),
-        const SizedBox(height: 10),
-        _RouteVerificationPanel(
-          shifts: shifts,
-          onEditTrip: onEditTrip,
-          onEditStop: onEditStop,
-          onConfirmTrip: onConfirmTrip,
-          onConfirmStop: onConfirmStop,
-        ),
-        const SizedBox(height: 10),
-        SizedBox(
-          width: double.infinity,
-          child: Row(
-            children: [
-              Expanded(
-                child: OutlinedButton.icon(
-                  onPressed: shifts.isEmpty ? null : onCopyCsv,
-                  icon: const Icon(Icons.copy_all_rounded),
-                  label: const Text('Copy CSV'),
-                ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: OutlinedButton.icon(
-                  onPressed: shifts.isEmpty ? null : onSaveCsv,
-                  icon: const Icon(Icons.save_alt_rounded),
-                  label: const Text('Save CSV'),
-                ),
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 8),
         if (shifts.isEmpty)
           const Text('No routes saved for this day.')
         else

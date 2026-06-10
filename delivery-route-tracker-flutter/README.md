@@ -88,6 +88,8 @@ Implemented in the current codebase:
 - The app attempts to recover an active shift when reopened.
 - Recovery uses a configurable grace period.
 - Android back/close navigation shows a warning while a shift is active.
+- End Shift uses a guarded save flow so repeated taps cannot start multiple finalization attempts.
+- Successful End Shift clears the active recovery copy so a saved shift is not accidentally restored as still active.
 
 ### Recovery Grace Period
 
@@ -280,6 +282,7 @@ Future migration may convert older route segments into the new trip/order model,
 - Manual trip earnings entry after a shift.
 - Uber Eats net earnings calculation with 25.5% deduction.
 - Calendar/day view for selected dates.
+- Reports tab for performance analytics, route playback, verification, timeline review, and exports.
 - Google Maps Timeline-style day route view.
 - Timeline playback with slider and tappable point details.
 - Route verification: confirm detected trips and stops after review.
@@ -306,6 +309,7 @@ These are feature milestones for this prototype. The package version in `pubspec
 | v0.8 | Production hardening | GPS quality filtering, active shift autosave, route verification, timeline playback, performance analytics, diagnostics, GPX/KML exports. |
 | v0.9 | Shift continuity and multi-order model | Accidental-close recovery, configurable recovery grace period, expanded lifecycle statuses, order/trip data model, stacked delivery support, active order count, trip closure rules, improved map markers and controls. |
 | v0.10 | Idle and active performance analytics | Calendar Performance period switch for day/week/month, active-order time calculation, no-order waiting time, waiting-vs-active ratio, waiting distance, and active delivery distance. |
+| v0.11 | Stop shift reliability and UI organization | Guarded End Shift finalization, active recovery cleanup after save, shorter Calendar tab, and separate Reports tab for analytics, verification, playback, and exports. |
 
 ## Working Process
 
