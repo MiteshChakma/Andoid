@@ -10,6 +10,8 @@ Latest local APK:
 
 [Download latest APK](releases/delivery-route-tracker-latest.apk)
 
+This APK was refreshed after the v0.11 stop-shift reliability and Reports tab update.
+
 Build output APK:
 
 `build/app/outputs/flutter-apk/app-release.apk`
